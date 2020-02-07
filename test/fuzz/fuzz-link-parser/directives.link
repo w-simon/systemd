@@ -1,5 +1,6 @@
 [Match]
 MACAddress=
+PermanentMACAddress=
 OriginalName=
 Path=
 Driver=
@@ -25,6 +26,8 @@ Duplex=
 AutoNegotiation=
 WakeOnLan=
 Port=
+ReceiveChecksumOffload=
+TransmitChecksumOffload=
 GenericSegmentationOffload=
 TCPSegmentationOffload=
 TCP6SegmentationOffload=

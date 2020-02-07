@@ -11,6 +11,7 @@
 #include "sd-netlink.h"
 
 #include "alloc-util.h"
+#include "bus-polkit.h"
 #include "bus-util.h"
 #include "conf-parser.h"
 #include "def.h"
@@ -38,8 +39,8 @@
 #include "udev-util.h"
 #include "virt.h"
 
-/* use 8 MB for receive socket kernel queue. */
-#define RCVBUF_SIZE    (8*1024*1024)
+/* use 128 MB for receive socket kernel queue. */
+#define RCVBUF_SIZE    (128*1024*1024)
 
 static int log_message_warning_errno(sd_netlink_message *m, int err, const char *msg) {
         const char *err_msg = NULL;
@@ -695,8 +696,8 @@ int manager_rtnl_process_neighbor(sd_netlink *rtnl, sd_netlink_message *message,
                                        strnull(addr_str), strnull(lladdr_str));
                         (void) neighbor_free(neighbor);
                 } else
-                        log_link_info(link, "Kernel removed a neighbor we don't remember: %s->%s, ignoring.",
-                                      strnull(addr_str), strnull(lladdr_str));
+                        log_link_debug(link, "Kernel removed a neighbor we don't remember: %s->%s, ignoring.",
+                                       strnull(addr_str), strnull(lladdr_str));
 
                 break;
 
@@ -855,9 +856,9 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                                        valid_str ? "for " : "forever", strempty(valid_str));
                         (void) address_drop(address);
                 } else
-                        log_link_info(link, "Kernel removed an address we don't remember: %s/%u (valid %s%s), ignoring.",
-                                      strnull(buf), prefixlen,
-                                      valid_str ? "for " : "forever", strempty(valid_str));
+                        log_link_debug(link, "Kernel removed an address we don't remember: %s/%u (valid %s%s), ignoring.",
+                                       strnull(buf), prefixlen,
+                                       valid_str ? "for " : "forever", strempty(valid_str));
 
                 break;
 
@@ -961,6 +962,7 @@ int manager_rtnl_process_rule(sd_netlink *rtnl, sd_netlink_message *message, voi
         _cleanup_free_ char *from = NULL, *to = NULL;
         RoutingPolicyRule *rule = NULL;
         const char *iif = NULL, *oif = NULL;
+        uint32_t suppress_prefixlen;
         Manager *m = userdata;
         unsigned flags;
         uint16_t type;
@@ -1136,6 +1138,20 @@ int manager_rtnl_process_rule(sd_netlink *rtnl, sd_netlink_message *message, voi
                 log_warning_errno(r, "rtnl: could not get FRA_DPORT_RANGE attribute, ignoring: %m");
                 return 0;
         }
+
+        r = sd_netlink_message_read(message, FRA_UID_RANGE, sizeof(tmp->uid_range), &tmp->uid_range);
+        if (r < 0 && r != -ENODATA) {
+                log_warning_errno(r, "rtnl: could not get FRA_UID_RANGE attribute, ignoring: %m");
+                return 0;
+        }
+
+        r = sd_netlink_message_read_u32(message, FRA_SUPPRESS_PREFIXLEN, &suppress_prefixlen);
+        if (r < 0 && r != -ENODATA) {
+                log_warning_errno(r, "rtnl: could not get FRA_SUPPRESS_PREFIXLEN attribute, ignoring: %m");
+                return 0;
+        }
+        if (r >= 0)
+                tmp->suppress_prefixlen = (int) suppress_prefixlen;
 
         (void) routing_policy_rule_get(m, tmp, &rule);
 

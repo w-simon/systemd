@@ -848,6 +848,10 @@ static int parse_argv(int argc, char *argv[]) {
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Network interface name not valid: %s", optarg);
 
+                        r = test_network_interface_initialized(optarg);
+                        if (r < 0)
+                                return r;
+
                         if (strv_extend(&arg_network_interfaces, optarg) < 0)
                                 return log_oom();
 
@@ -861,6 +865,10 @@ static int parse_argv(int argc, char *argv[]) {
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "MACVLAN network interface name not valid: %s", optarg);
 
+                        r = test_network_interface_initialized(optarg);
+                        if (r < 0)
+                                return r;
+
                         if (strv_extend(&arg_network_macvlan, optarg) < 0)
                                 return log_oom();
 
@@ -873,6 +881,10 @@ static int parse_argv(int argc, char *argv[]) {
                         if (!ifname_valid(optarg))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "IPVLAN network interface name not valid: %s", optarg);
+
+                        r = test_network_interface_initialized(optarg);
+                        if (r < 0)
+                                return r;
 
                         if (strv_extend(&arg_network_ipvlan, optarg) < 0)
                                 return log_oom();
@@ -1527,6 +1539,9 @@ static int verify_arguments(void) {
                 arg_kill_signal = SIGRTMIN+3;
 
         if (arg_volatile_mode != VOLATILE_NO) /* Make sure all file systems contained in the image are mounted read-only if we are in volatile mode */
+                arg_read_only = true;
+
+        if (has_custom_root_mount(arg_custom_mounts, arg_n_custom_mounts))
                 arg_read_only = true;
 
         if (arg_keep_unit && arg_register && cg_pid_get_owner_uid(0, NULL) >= 0)
@@ -3294,10 +3309,12 @@ static int outer_child(
 
                 r = dissected_image_mount(dissected_image, directory, arg_uid_shift,
                                           DISSECT_IMAGE_MOUNT_ROOT_ONLY|DISSECT_IMAGE_DISCARD_ON_LOOP|
-                                          (arg_read_only ? DISSECT_IMAGE_READ_ONLY : 0)|
+                                          (arg_read_only ? DISSECT_IMAGE_READ_ONLY : DISSECT_IMAGE_FSCK)|
                                           (arg_start_mode == START_BOOT ? DISSECT_IMAGE_VALIDATE_OS : 0));
+                if (r == -EUCLEAN)
+                        return log_error_errno(r, "File system check for image failed: %m");
                 if (r < 0)
-                        return r;
+                        return log_error_errno(r, "Failed to mount image root file system: %m");
         }
 
         r = determine_uid_shift(directory);
@@ -3381,9 +3398,11 @@ static int outer_child(
         if (dissected_image) {
                 /* Now we know the uid shift, let's now mount everything else that might be in the image. */
                 r = dissected_image_mount(dissected_image, directory, arg_uid_shift,
-                                          DISSECT_IMAGE_MOUNT_NON_ROOT_ONLY|DISSECT_IMAGE_DISCARD_ON_LOOP|(arg_read_only ? DISSECT_IMAGE_READ_ONLY : 0));
+                                          DISSECT_IMAGE_MOUNT_NON_ROOT_ONLY|DISSECT_IMAGE_DISCARD_ON_LOOP|(arg_read_only ? DISSECT_IMAGE_READ_ONLY : DISSECT_IMAGE_FSCK));
+                if (r == -EUCLEAN)
+                        return log_error_errno(r, "File system check for image failed: %m");
                 if (r < 0)
-                        return r;
+                        return log_error_errno(r, "Failed to mount image file system: %m");
         }
 
         if (arg_unified_cgroup_hierarchy == CGROUP_UNIFIED_UNKNOWN) {
@@ -3426,7 +3445,8 @@ static int outer_child(
         if (r < 0)
                 return r;
 
-        if (arg_read_only && arg_volatile_mode == VOLATILE_NO) {
+        if (arg_read_only && arg_volatile_mode == VOLATILE_NO &&
+                !has_custom_root_mount(arg_custom_mounts, arg_n_custom_mounts)) {
                 r = bind_remount_recursive(directory, MS_RDONLY, MS_RDONLY, NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to make tree read-only: %m");
@@ -4199,7 +4219,7 @@ static int run_container(
         int ifi = 0, r;
         ssize_t l;
         sigset_t mask_chld;
-        _cleanup_close_ int netns_fd = -1;
+        _cleanup_close_ int child_netns_fd = -1;
 
         assert_se(sigemptyset(&mask_chld) == 0);
         assert_se(sigaddset(&mask_chld, SIGCHLD) == 0);
@@ -4258,11 +4278,11 @@ static int run_container(
                 return log_error_errno(errno, "Failed to install SIGCHLD handler: %m");
 
         if (arg_network_namespace_path) {
-                netns_fd = open(arg_network_namespace_path, O_RDONLY|O_NOCTTY|O_CLOEXEC);
-                if (netns_fd < 0)
+                child_netns_fd = open(arg_network_namespace_path, O_RDONLY|O_NOCTTY|O_CLOEXEC);
+                if (child_netns_fd < 0)
                         return log_error_errno(errno, "Cannot open file %s: %m", arg_network_namespace_path);
 
-                r = fd_is_network_ns(netns_fd);
+                r = fd_is_network_ns(child_netns_fd);
                 if (r == -EUCLEAN)
                         log_debug_errno(r, "Cannot determine if passed network namespace path '%s' really refers to a network namespace, assuming it does.", arg_network_namespace_path);
                 else if (r < 0)
@@ -4307,7 +4327,7 @@ static int run_container(
                                 master_pty_socket_pair[1],
                                 unified_cgroup_hierarchy_socket_pair[1],
                                 fds,
-                                netns_fd);
+                                child_netns_fd);
                 if (r < 0)
                         _exit(EXIT_FAILURE);
 
@@ -4409,7 +4429,15 @@ static int run_container(
                                 return log_error_errno(SYNTHETIC_ERRNO(ESRCH), "Child died too early");
                 }
 
-                r = move_network_interfaces(*pid, arg_network_interfaces);
+                if (child_netns_fd < 0) {
+                        /* Make sure we have an open file descriptor to the child's network
+                         * namespace so it stays alive even if the child exits. */
+                        r = namespace_open(*pid, NULL, NULL, &child_netns_fd, NULL, NULL);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to open child network namespace: %m");
+                }
+
+                r = move_network_interfaces(child_netns_fd, arg_network_interfaces);
                 if (r < 0)
                         return r;
 
@@ -4654,6 +4682,36 @@ static int run_container(
 
         /* Normally redundant, but better safe than sorry */
         (void) kill(*pid, SIGKILL);
+
+        if (arg_private_network) {
+                /* Move network interfaces back to the parent network namespace. We use `safe_fork`
+                 * to avoid having to move the parent to the child network namespace. */
+                r = safe_fork(NULL, FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_WAIT|FORK_LOG, NULL);
+                if (r < 0)
+                        return r;
+
+                if (r == 0) {
+                        _cleanup_close_ int parent_netns_fd = -1;
+
+                        r = namespace_open(getpid(), NULL, NULL, &parent_netns_fd, NULL, NULL);
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to open parent network namespace: %m");
+                                _exit(EXIT_FAILURE);
+                        }
+
+                        r = namespace_enter(-1, -1, child_netns_fd, -1, -1);
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to enter child network namespace: %m");
+                                _exit(EXIT_FAILURE);
+                        }
+
+                        r = move_network_interfaces(parent_netns_fd, arg_network_interfaces);
+                        if (r < 0)
+                                log_error_errno(r, "Failed to move network interfaces back to parent network namespace: %m");
+
+                        _exit(r < 0 ? EXIT_FAILURE : EXIT_SUCCESS);
+                }
+        }
 
         r = wait_for_container(*pid, &container_status);
         *pid = 0;
@@ -5058,14 +5116,14 @@ static int run(int argc, char *argv[]) {
                                 loop->fd,
                                 arg_image,
                                 arg_root_hash, arg_root_hash_size,
-                                DISSECT_IMAGE_REQUIRE_ROOT,
+                                DISSECT_IMAGE_REQUIRE_ROOT|DISSECT_IMAGE_RELAX_VAR_CHECK,
                                 &dissected_image);
                 if (r == -ENOPKG) {
                         /* dissected_image_and_warn() already printed a brief error message. Extend on that with more details */
                         log_notice("Note that the disk image needs to\n"
                                    "    a) either contain only a single MBR partition of type 0x83 that is marked bootable\n"
                                    "    b) or contain a single GPT partition of type 0FC63DAF-8483-4772-8E79-3D69D8477DE4\n"
-                                   "    c) or follow http://www.freedesktop.org/wiki/Specifications/DiscoverablePartitionsSpec/\n"
+                                   "    c) or follow https://systemd.io/DISCOVERABLE_PARTITIONS\n"
                                    "    d) or contain a file system without a partition table\n"
                                    "in order to be bootable with systemd-nspawn.");
                         goto finish;

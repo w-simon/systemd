@@ -19,6 +19,7 @@ static inline bool gid_is_valid(gid_t gid) {
 }
 
 int parse_uid(const char *s, uid_t* ret_uid);
+int parse_uid_range(const char *s, uid_t *ret_lower, uid_t *ret_upper);
 
 static inline int parse_gid(const char *s, gid_t *ret_gid) {
         return parse_uid(s, (uid_t*) ret_gid);
@@ -41,6 +42,9 @@ char* gid_to_name(gid_t gid);
 
 int in_gid(gid_t gid);
 int in_group(const char *name);
+
+int merge_gid_lists(const gid_t *list1, size_t size1, const gid_t *list2, size_t size2, gid_t **result);
+int getgroups_alloc(gid_t** gids);
 
 int get_home_dir(char **ret);
 int get_shell(char **_ret);
@@ -133,7 +137,5 @@ int putgrent_sane(const struct group *gr, FILE *stream);
 int fgetsgent_sane(FILE *stream, struct sgrp **sg);
 int putsgent_sane(const struct sgrp *sg, FILE *stream);
 #endif
-
-int make_salt(char **ret);
 
 bool is_nologin_shell(const char *shell);

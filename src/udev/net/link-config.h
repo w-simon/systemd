@@ -36,6 +36,7 @@ struct link_config {
         char *filename;
 
         Set *match_mac;
+        Set *match_permanent_mac;
         char **match_path;
         char **match_driver;
         char **match_type;
@@ -52,7 +53,7 @@ struct link_config {
         char **alternative_names;
         char *alias;
         uint32_t mtu;
-        size_t speed;
+        uint64_t speed;
         Duplex duplex;
         int autonegotiation;
         uint32_t advertise[N_ADVERTISE];

@@ -906,7 +906,7 @@ static int mount_inaccessible(const char *dest, CustomMount *m) {
 
         r = mount_verbose(m->graceful ? LOG_DEBUG : LOG_ERR, NULL, where, NULL, MS_BIND|MS_RDONLY|MS_REMOUNT, NULL);
         if (r < 0) {
-                umount_verbose(where);
+                (void) umount_verbose(where);
                 return m->graceful ? 0 : r;
         }
 
@@ -987,6 +987,19 @@ int mount_custom(
         }
 
         return 0;
+}
+
+bool has_custom_root_mount(const CustomMount *mounts, size_t n) {
+        size_t i;
+
+        for (i = 0; i < n; i++) {
+                const CustomMount *m = mounts + i;
+
+                if (path_equal(m->destination, "/"))
+                        return true;
+        }
+
+        return false;
 }
 
 static int setup_volatile_state(const char *directory, uid_t uid_shift, const char *selinux_apifs_context) {

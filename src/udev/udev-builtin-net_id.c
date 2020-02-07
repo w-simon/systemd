@@ -27,7 +27,7 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "naming-scheme.h"
+#include "netif-naming-scheme.h"
 #include "parse-util.h"
 #include "proc-cmdline.h"
 #include "stdio-util.h"
@@ -330,8 +330,9 @@ static int dev_pci_slot(sd_device *dev, struct netnames *names) {
                         char str[PATH_MAX];
                         _cleanup_free_ char *address = NULL;
 
-                        if (dent->d_name[0] == '.')
+                        if (dot_or_dot_dot(dent->d_name))
                                 continue;
+
                         r = safe_atou_full(dent->d_name, 10, &i);
                         if (r < 0 || i <= 0)
                                 continue;

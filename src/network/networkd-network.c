@@ -160,14 +160,14 @@ int network_verify(Network *network) {
         assert(network);
         assert(network->filename);
 
-        if (set_isempty(network->match_mac) && strv_isempty(network->match_path) &&
-            strv_isempty(network->match_driver) && strv_isempty(network->match_type) &&
-            strv_isempty(network->match_name) && strv_isempty(network->match_property) &&
-            strv_isempty(network->match_ssid) && !network->conditions)
-                log_warning("%s: No valid settings found in the [Match] section. "
-                            "The file will match all interfaces. "
-                            "If that is intended, please add Name=* in the [Match] section.",
-                            network->filename);
+        if (set_isempty(network->match_mac) && set_isempty(network->match_permanent_mac) &&
+            strv_isempty(network->match_path) && strv_isempty(network->match_driver) &&
+            strv_isempty(network->match_type) && strv_isempty(network->match_name) &&
+            strv_isempty(network->match_property) && strv_isempty(network->match_ssid) && !network->conditions)
+                return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
+                                         "%s: No valid settings found in the [Match] section, ignoring file. "
+                                         "To match all interfaces, add Name=* in the [Match] section.",
+                                         network->filename);
 
         /* skip out early if configuration does not match the environment */
         if (!condition_test_list(network->conditions, NULL, NULL, NULL))
@@ -375,7 +375,7 @@ int network_load_one(Manager *manager, OrderedHashmap **networks, const char *fi
                 .n_ref = 1,
 
                 .required_for_online = true,
-                .required_operstate_for_online = LINK_OPERSTATE_DEGRADED,
+                .required_operstate_for_online = LINK_OPERSTATE_RANGE_DEFAULT,
                 .dhcp = ADDRESS_FAMILY_NO,
                 .dhcp_critical = -1,
                 .dhcp_use_ntp = true,
@@ -481,7 +481,13 @@ int network_load_one(Manager *manager, OrderedHashmap **networks, const char *fi
                               "IPv6Prefix\0"
                               "IPv6RoutePrefix\0"
                               "TrafficControlQueueingDiscipline\0"
-                              "CAN\0",
+                              "CAN\0"
+                              "ControlledDelay\0"
+                              "FairQueueing\0"
+                              "FairQueueingControlledDelay\0"
+                              "NetworkEmulator\0"
+                              "StochasticFairnessQueueing\0"
+                              "TokenBucketFilter\0",
                               config_item_perf_lookup, network_network_gperf_lookup,
                               CONFIG_PARSE_WARN, network);
         if (r < 0)
@@ -601,6 +607,7 @@ static Network *network_free(Network *network) {
         free(network->filename);
 
         set_free_free(network->match_mac);
+        set_free_free(network->match_permanent_mac);
         strv_free(network->match_path);
         strv_free(network->match_driver);
         strv_free(network->match_type);
@@ -698,6 +705,7 @@ static Network *network_free(Network *network) {
 
         ordered_hashmap_free(network->dhcp_client_send_options);
         ordered_hashmap_free(network->dhcp_server_send_options);
+        ordered_hashmap_free(network->ipv6_tokens);
 
         return mfree(network);
 }
@@ -721,7 +729,8 @@ int network_get_by_name(Manager *manager, const char *name, Network **ret) {
 }
 
 int network_get(Manager *manager, sd_device *device,
-                const char *ifname, char * const *alternative_names, const struct ether_addr *address,
+                const char *ifname, char * const *alternative_names,
+                const struct ether_addr *address, const struct ether_addr *permanent_address,
                 enum nl80211_iftype wlan_iftype, const char *ssid, const struct ether_addr *bssid,
                 Network **ret) {
         Network *network;
@@ -731,10 +740,12 @@ int network_get(Manager *manager, sd_device *device,
         assert(ret);
 
         ORDERED_HASHMAP_FOREACH(network, manager->networks, i)
-                if (net_match_config(network->match_mac, network->match_path, network->match_driver,
+                if (net_match_config(network->match_mac, network->match_permanent_mac,
+                                     network->match_path, network->match_driver,
                                      network->match_type, network->match_name, network->match_property,
                                      network->match_wlan_iftype, network->match_ssid, network->match_bssid,
-                                     device, address, ifname, alternative_names, wlan_iftype, ssid, bssid)) {
+                                     device, address, permanent_address,
+                                     ifname, alternative_names, wlan_iftype, ssid, bssid)) {
                         if (network->match_name && device) {
                                 const char *attr;
                                 uint8_t name_assign_type = NET_NAME_UNKNOWN;
@@ -1296,18 +1307,18 @@ int config_parse_required_for_online(
                 void *userdata) {
 
         Network *network = data;
-        LinkOperationalState s;
+        LinkOperationalStateRange range;
         bool required = true;
         int r;
 
         if (isempty(rvalue)) {
                 network->required_for_online = true;
-                network->required_operstate_for_online = LINK_OPERSTATE_DEGRADED;
+                network->required_operstate_for_online = LINK_OPERSTATE_RANGE_DEFAULT;
                 return 0;
         }
 
-        s = link_operstate_from_string(rvalue);
-        if (s < 0) {
+        r = parse_operational_state_range(rvalue, &range);
+        if (r < 0) {
                 r = parse_boolean(rvalue);
                 if (r < 0) {
                         log_syntax(unit, LOG_ERR, filename, line, r,
@@ -1317,11 +1328,11 @@ int config_parse_required_for_online(
                 }
 
                 required = r;
-                s = LINK_OPERSTATE_DEGRADED;
+                range = LINK_OPERSTATE_RANGE_DEFAULT;
         }
 
         network->required_for_online = required;
-        network->required_operstate_for_online = s;
+        network->required_operstate_for_online = range;
 
         return 0;
 }
