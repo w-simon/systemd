@@ -15,6 +15,7 @@
 #include "copy.h"
 #include "dirent-util.h"
 #include "fd-util.h"
+#include "fileio.h"
 #include "fs-util.h"
 #include "io-util.h"
 #include "macro.h"
@@ -569,10 +570,9 @@ static int fd_copy_directory(
         if (fdf < 0)
                 return -errno;
 
-        d = fdopendir(fdf);
+        d = take_fdopendir(&fdf);
         if (!d)
                 return -errno;
-        fdf = -1;
 
         exists = false;
         if (copy_flags & COPY_MERGE_EMPTY) {
@@ -965,6 +965,21 @@ int copy_times(int fdf, int fdt, CopyFlags flags) {
                 if (fd_getcrtime(fdf, &crtime) >= 0)
                         (void) fd_setcrtime(fdt, crtime);
         }
+
+        return 0;
+}
+
+int copy_access(int fdf, int fdt) {
+        struct stat st;
+
+        assert(fdf >= 0);
+        assert(fdt >= 0);
+
+        if (fstat(fdf, &st) < 0)
+                return -errno;
+
+        if (fchmod(fdt, st.st_mode & 07777) < 0)
+                return -errno;
 
         return 0;
 }

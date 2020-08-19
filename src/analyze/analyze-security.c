@@ -4,6 +4,7 @@
 
 #include "analyze-security.h"
 #include "bus-error.h"
+#include "bus-map-properties.h"
 #include "bus-unit-util.h"
 #include "bus-util.h"
 #include "env-util.h"
@@ -91,7 +92,7 @@ struct security_info {
 
         char **system_call_architectures;
 
-        bool system_call_filter_whitelist;
+        bool system_call_filter_allow_list;
         Set *system_call_filter;
 
         uint32_t _umask;
@@ -141,7 +142,7 @@ static void security_info_free(struct security_info *i) {
         strv_free(i->supplementary_groups);
         strv_free(i->system_call_architectures);
 
-        set_free_free(i->system_call_filter);
+        set_free(i->system_call_filter);
 }
 
 static bool security_info_runs_privileged(const struct security_info *i)  {
@@ -492,7 +493,7 @@ static int assess_system_call_architectures(
 
 #if HAVE_SECCOMP
 
-static bool syscall_names_in_filter(Set *s, bool whitelist, const SyscallFilterSet *f) {
+static bool syscall_names_in_filter(Set *s, bool allow_list, const SyscallFilterSet *f, const char **ret_offending_syscall) {
         const char *syscall;
 
         NULSTR_FOREACH(syscall, f->value) {
@@ -502,7 +503,7 @@ static bool syscall_names_in_filter(Set *s, bool whitelist, const SyscallFilterS
                         const SyscallFilterSet *g;
 
                         assert_se(g = syscall_filter_set_find(syscall));
-                        if (syscall_names_in_filter(s, whitelist, g))
+                        if (syscall_names_in_filter(s, allow_list, g, ret_offending_syscall))
                                 return true; /* bad! */
 
                         continue;
@@ -513,12 +514,15 @@ static bool syscall_names_in_filter(Set *s, bool whitelist, const SyscallFilterS
                 if (id < 0)
                         continue;
 
-                if (set_contains(s, syscall) == whitelist) {
+                if (set_contains(s, syscall) == allow_list) {
                         log_debug("Offending syscall filter item: %s", syscall);
+                        if (ret_offending_syscall)
+                                *ret_offending_syscall = syscall;
                         return true; /* bad! */
                 }
         }
 
+        *ret_offending_syscall = NULL;
         return false;
 }
 
@@ -529,43 +533,49 @@ static int assess_system_call_filter(
                 uint64_t *ret_badness,
                 char **ret_description) {
 
-        const SyscallFilterSet *f;
-        char *d = NULL;
-        uint64_t b;
-
         assert(a);
         assert(info);
         assert(ret_badness);
         assert(ret_description);
 
         assert(a->parameter < _SYSCALL_FILTER_SET_MAX);
-        f = syscall_filter_sets + a->parameter;
+        const SyscallFilterSet *f = syscall_filter_sets + a->parameter;
 
-        if (!info->system_call_filter_whitelist && set_isempty(info->system_call_filter)) {
+        char *d = NULL;
+        uint64_t b;
+
+        if (!info->system_call_filter_allow_list && set_isempty(info->system_call_filter)) {
                 d = strdup("Service does not filter system calls");
                 b = 10;
         } else {
                 bool bad;
+                const char *offender = NULL;
 
                 log_debug("Analyzing system call filter, checking against: %s", f->name);
-                bad = syscall_names_in_filter(info->system_call_filter, info->system_call_filter_whitelist, f);
+                bad = syscall_names_in_filter(info->system_call_filter, info->system_call_filter_allow_list, f, &offender);
                 log_debug("Result: %s", bad ? "bad" : "good");
 
-                if (info->system_call_filter_whitelist) {
+                if (info->system_call_filter_allow_list) {
                         if (bad) {
-                                (void) asprintf(&d, "System call whitelist defined for service, and %s is included", f->name);
+                                (void) asprintf(&d, "System call allow list defined for service, and %s is included "
+                                                "(e.g. %s is allowed)",
+                                                f->name, offender);
                                 b = 9;
                         } else {
-                                (void) asprintf(&d, "System call whitelist defined for service, and %s is not included", f->name);
+                                (void) asprintf(&d, "System call allow list defined for service, and %s is not included",
+                                                f->name);
                                 b = 0;
                         }
                 } else {
                         if (bad) {
-                                (void) asprintf(&d, "System call blacklist defined for service, and %s is not included", f->name);
+                                (void) asprintf(&d, "System call deny list defined for service, and %s is not included "
+                                                "(e.g. %s is allowed)",
+                                                f->name, offender);
                                 b = 10;
                         } else {
-                                (void) asprintf(&d, "System call blacklist defined for service, and %s is included", f->name);
-                                b = 5;
+                                (void) asprintf(&d, "System call deny list defined for service, and %s is included",
+                                                f->name);
+                                b = 0;
                         }
                 }
         }
@@ -599,13 +609,13 @@ static int assess_ip_address_allow(
                 d = strdup("Service defines custom ingress/egress IP filters with BPF programs");
                 b = 0;
         } else if (!info->ip_address_deny_all) {
-                d = strdup("Service does not define an IP address whitelist");
+                d = strdup("Service does not define an IP address allow list");
                 b = 10;
         } else if (info->ip_address_allow_other) {
-                d = strdup("Service defines IP address whitelist with non-localhost entries");
+                d = strdup("Service defines IP address allow list with non-localhost entries");
                 b = 5;
         } else if (info->ip_address_allow_localhost) {
-                d = strdup("Service defines IP address whitelist with only localhost entries");
+                d = strdup("Service defines IP address allow list with only localhost entries");
                 b = 2;
         } else {
                 d = strdup("Service blocks all IP address ranges");
@@ -913,7 +923,7 @@ static const struct security_assessor security_assessor_table[] = {
                 .parameter = (UINT64_C(1) << CAP_NET_ADMIN),
         },
         {
-                .id = "CapabilityBoundingSet=~CAP_RAWIO",
+                .id = "CapabilityBoundingSet=~CAP_SYS_RAWIO",
                 .description_good = "Service has no raw I/O access",
                 .description_bad = "Service has raw I/O access",
                 .url = "https://www.freedesktop.org/software/systemd/man/systemd.exec.html#CapabilityBoundingSet=",
@@ -1458,11 +1468,11 @@ static int assess(const struct security_info *info, Table *overview_table, Analy
                 if (!details_table)
                         return log_oom();
 
-                (void) table_set_sort(details_table, 3, 1, (size_t) -1);
+                (void) table_set_sort(details_table, (size_t) 3, (size_t) 1, (size_t) -1);
                 (void) table_set_reverse(details_table, 3, true);
 
                 if (getenv_bool("SYSTEMD_ANALYZE_DEBUG") <= 0)
-                        (void) table_set_display(details_table, 0, 1, 2, 6, (size_t) -1);
+                        (void) table_set_display(details_table, (size_t) 0, (size_t) 1, (size_t) 2, (size_t) 6, (size_t) -1);
         }
 
         for (i = 0; i < ELEMENTSOF(security_assessor_table); i++) {
@@ -1639,7 +1649,7 @@ static int property_read_restrict_address_families(
                 void *userdata) {
 
         struct security_info *info = userdata;
-        int whitelist, r;
+        int allow_list, r;
 
         assert(bus);
         assert(member);
@@ -1649,7 +1659,7 @@ static int property_read_restrict_address_families(
         if (r < 0)
                 return r;
 
-        r = sd_bus_message_read(m, "b", &whitelist);
+        r = sd_bus_message_read(m, "b", &allow_list);
         if (r < 0)
                 return r;
 
@@ -1657,7 +1667,7 @@ static int property_read_restrict_address_families(
                 info->restrict_address_family_unix =
                 info->restrict_address_family_netlink =
                 info->restrict_address_family_packet =
-                info->restrict_address_family_other = whitelist;
+                info->restrict_address_family_other = allow_list;
 
         r = sd_bus_message_enter_container(m, 'a', "s");
         if (r < 0)
@@ -1673,15 +1683,15 @@ static int property_read_restrict_address_families(
                         break;
 
                 if (STR_IN_SET(name, "AF_INET", "AF_INET6"))
-                        info->restrict_address_family_inet = !whitelist;
+                        info->restrict_address_family_inet = !allow_list;
                 else if (streq(name, "AF_UNIX"))
-                        info->restrict_address_family_unix = !whitelist;
+                        info->restrict_address_family_unix = !allow_list;
                 else if (streq(name, "AF_NETLINK"))
-                        info->restrict_address_family_netlink = !whitelist;
+                        info->restrict_address_family_netlink = !allow_list;
                 else if (streq(name, "AF_PACKET"))
-                        info->restrict_address_family_packet = !whitelist;
+                        info->restrict_address_family_packet = !allow_list;
                 else
-                        info->restrict_address_family_other = !whitelist;
+                        info->restrict_address_family_other = !allow_list;
         }
 
         r = sd_bus_message_exit_container(m);
@@ -1699,7 +1709,7 @@ static int property_read_system_call_filter(
                 void *userdata) {
 
         struct security_info *info = userdata;
-        int whitelist, r;
+        int allow_list, r;
 
         assert(bus);
         assert(member);
@@ -1709,11 +1719,11 @@ static int property_read_system_call_filter(
         if (r < 0)
                 return r;
 
-        r = sd_bus_message_read(m, "b", &whitelist);
+        r = sd_bus_message_read(m, "b", &allow_list);
         if (r < 0)
                 return r;
 
-        info->system_call_filter_whitelist = whitelist;
+        info->system_call_filter_allow_list = allow_list;
 
         r = sd_bus_message_enter_container(m, 'a', "s");
         if (r < 0)
@@ -1728,11 +1738,7 @@ static int property_read_system_call_filter(
                 if (r == 0)
                         break;
 
-                r = set_ensure_allocated(&info->system_call_filter, &string_hash_ops);
-                if (r < 0)
-                        return r;
-
-                r = set_put_strdup(info->system_call_filter, name);
+                r = set_put_strdup(&info->system_call_filter, name);
                 if (r < 0)
                         return r;
         }

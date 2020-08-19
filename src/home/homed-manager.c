@@ -12,6 +12,7 @@
 #include "btrfs-util.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
+#include "bus-log-control-api.h"
 #include "bus-polkit.h"
 #include "clean-ipc.h"
 #include "conf-files.h"
@@ -23,6 +24,7 @@
 #include "fs-util.h"
 #include "gpt.h"
 #include "home-util.h"
+#include "homed-conf.h"
 #include "homed-home-bus.h"
 #include "homed-home.h"
 #include "homed-manager-bus.h"
@@ -183,9 +185,17 @@ int manager_new(Manager **ret) {
 
         assert(ret);
 
-        m = new0(Manager, 1);
+        m = new(Manager, 1);
         if (!m)
                 return -ENOMEM;
+
+        *m = (Manager) {
+                .default_storage = _USER_STORAGE_INVALID,
+        };
+
+        r = manager_parse_config_file(m);
+        if (r < 0)
+                return r;
 
         r = sd_event_default(&m->event);
         if (r < 0)
@@ -249,6 +259,8 @@ Manager* manager_free(Manager *m) {
         hashmap_free(m->public_keys);
 
         varlink_server_unref(m->varlink_server);
+
+        free(m->default_file_system_type);
 
         return mfree(m);
 }
@@ -317,21 +329,36 @@ static int manager_add_home_by_record(
         _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
         unsigned line, column;
         int r, is_signed;
+        struct stat st;
         Home *h;
 
         assert(m);
         assert(name);
         assert(fname);
 
+        if (fstatat(dir_fd, fname, &st, 0) < 0)
+                return log_error_errno(errno, "Failed to stat identity record %s: %m", fname);
+
+        if (!S_ISREG(st.st_mode)) {
+                log_debug("Identity record file %s is not a regular file, ignoring.", fname);
+                return 0;
+        }
+
+        if (st.st_size == 0)
+                goto unlink_this_file;
+
         r = json_parse_file_at(NULL, dir_fd, fname, JSON_PARSE_SENSITIVE, &v, &line, &column);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse identity record at %s:%u%u: %m", fname, line, column);
+
+        if (json_variant_is_blank_object(v))
+                goto unlink_this_file;
 
         hr = user_record_new();
         if (!hr)
                 return log_oom();
 
-        r = user_record_load(hr, v, USER_RECORD_LOAD_REFUSE_SECRET);
+        r = user_record_load(hr, v, USER_RECORD_LOAD_REFUSE_SECRET|USER_RECORD_LOG);
         if (r < 0)
                 return r;
 
@@ -367,7 +394,7 @@ static int manager_add_home_by_record(
 
                 /* If we acquired a record now for a previously unallocated entry, then reset the state. This
                  * makes sure home_get_state() will check for the availability of the image file dynamically
-                 * in order to detect to distuingish HOME_INACTIVE and HOME_ABSENT. */
+                 * in order to detect to distinguish HOME_INACTIVE and HOME_ABSENT. */
                 if (h->state == HOME_UNFIXATED)
                         h->state = _HOME_STATE_INVALID;
         } else {
@@ -382,6 +409,19 @@ static int manager_add_home_by_record(
         h->signed_locally = is_signed == USER_RECORD_SIGNED_EXCLUSIVE;
 
         return 1;
+
+unlink_this_file:
+        /* If this is an empty file, then let's just remove it. An empty file is not useful in any case, and
+         * apparently xfs likes to leave empty files around when not unmounted cleanly (see
+         * https://github.com/systemd/systemd/issues/15178 for example). Note that we don't delete non-empty
+         * files even if they are invalid, because that's just too risky, we might delete data the user still
+         * needs. But empty files are never useful, hence let's just remove them. */
+
+        if (unlinkat(dir_fd, fname, 0) < 0)
+                return log_error_errno(errno, "Failed to remove empty user record file %s: %m", fname);
+
+        log_notice("Discovered empty user record file /var/lib/systemd/home/%s, removed automatically.", fname);
+        return 0;
 }
 
 static int manager_enumerate_records(Manager *m) {
@@ -473,7 +513,7 @@ static int search_quota(uid_t uid, const char *exclude_quota_path) {
                         if (ERRNO_IS_NOT_SUPPORTED(r))
                                 log_debug_errno(r, "No UID quota support on %s, ignoring.", where);
                         else
-                                log_warning_errno(r, "Failed to query quota on %s, ignoring.", where);
+                                log_warning_errno(r, "Failed to query quota on %s, ignoring: %m", where);
 
                         continue;
                 }
@@ -631,7 +671,7 @@ static int manager_add_home_by_image(
                 }
 
                 if (!same) {
-                        log_debug("Found a multiple images for a user '%s', ignoring image '%s'.", user_name, image_path);
+                        log_debug("Found multiple images for user '%s', ignoring image '%s'.", user_name, image_path);
                         return 0;
                 }
         } else {
@@ -768,7 +808,7 @@ static int manager_assess_image(
                 r = stat(path, &st);
         if (r < 0)
                 return log_full_errno(errno == ENOENT ? LOG_DEBUG : LOG_WARNING, errno,
-                                      "Failed to stat directory entry '%s', ignoring: %m", dentry_name);
+                                      "Failed to stat() directory entry '%s', ignoring: %m", dentry_name);
 
         if (S_ISREG(st.st_mode)) {
                 _cleanup_free_ char *n = NULL, *user_name = NULL, *realm = NULL;
@@ -833,7 +873,7 @@ static int manager_assess_image(
                                 if (errno == ENODATA)
                                         log_debug_errno(errno, "Determined %s is not fscrypt encrypted.", path);
                                 else if (ERRNO_IS_NOT_SUPPORTED(errno))
-                                        log_debug_errno(errno, "Determined %s is not fscrypt encrypted because kernel or file system don't support it.", path);
+                                        log_debug_errno(errno, "Determined %s is not fscrypt encrypted because kernel or file system doesn't support it.", path);
                                 else
                                         log_debug_errno(errno, "FS_IOC_GET_ENCRYPTION_POLICY failed with unexpected error code on %s, ignoring: %m", path);
 
@@ -878,21 +918,9 @@ static int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to connect to system bus: %m");
 
-        r = sd_bus_add_object_vtable(m->bus, NULL, "/org/freedesktop/home1", "org.freedesktop.home1.Manager", manager_vtable, m);
+        r = bus_add_implementation(m->bus, &manager_object, m);
         if (r < 0)
-                return log_error_errno(r, "Failed to add manager object vtable: %m");
-
-        r = sd_bus_add_fallback_vtable(m->bus, NULL, "/org/freedesktop/home1/home", "org.freedesktop.home1.Home", home_vtable, bus_home_object_find, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add image object vtable: %m");
-
-        r = sd_bus_add_node_enumerator(m->bus, NULL, "/org/freedesktop/home1/home", bus_home_node_enumerator, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add image enumerator: %m");
-
-        r = sd_bus_add_object_manager(m->bus, NULL, "/org/freedesktop/home1/home");
-        if (r < 0)
-                return log_error_errno(r, "Failed to add object manager: %m");
+                return r;
 
         r = sd_bus_request_name_async(m->bus, NULL, "org.freedesktop.home1", 0, NULL, NULL);
         if (r < 0)
@@ -957,10 +985,7 @@ static ssize_t read_datagram(int fd, struct ucred *ret_sender, void **ret) {
                 return -ENOMEM;
 
         if (ret_sender) {
-                union {
-                        struct cmsghdr cmsghdr;
-                        uint8_t buf[CMSG_SPACE(sizeof(struct ucred))];
-                } control;
+                CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct ucred))) control;
                 bool found_ucred = false;
                 struct cmsghdr *cmsg;
                 struct msghdr mh;
@@ -976,9 +1001,9 @@ static ssize_t read_datagram(int fd, struct ucred *ret_sender, void **ret) {
                         .msg_controllen = sizeof(control),
                 };
 
-                m = recvmsg(fd, &mh, MSG_DONTWAIT|MSG_CMSG_CLOEXEC);
+                m = recvmsg_safe(fd, &mh, MSG_DONTWAIT|MSG_CMSG_CLOEXEC);
                 if (m < 0)
-                        return -errno;
+                        return m;
 
                 cmsg_close_all(&mh);
 
@@ -1042,7 +1067,7 @@ static int on_notify_socket(sd_event_source *s, int fd, uint32_t revents, void *
 
         h = hashmap_get(m->homes_by_worker_pid, PID_TO_PTR(sender.pid));
         if (!h) {
-                log_warning("Recieved notify datagram of unknown process, ignoring.");
+                log_warning("Received notify datagram of unknown process, ignoring.");
                 return 0;
         }
 
@@ -1056,7 +1081,10 @@ static int on_notify_socket(sd_event_source *s, int fd, uint32_t revents, void *
 
 static int manager_listen_notify(Manager *m) {
         _cleanup_close_ int fd = -1;
-        union sockaddr_union sa;
+        union sockaddr_union sa = {
+                .un.sun_family = AF_UNIX,
+                .un.sun_path = "/run/systemd/home/notify",
+        };
         int r;
 
         assert(m);
@@ -1065,10 +1093,6 @@ static int manager_listen_notify(Manager *m) {
         fd = socket(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
         if (fd < 0)
                 return log_error_errno(errno, "Failed to create listening socket: %m");
-
-        r = sockaddr_un_set_path(&sa.un, "/run/systemd/home/notify");
-        if (r < 0)
-                return log_error_errno(r, "Failed to set AF_UNIX socket path: %m");
 
         (void) mkdir_parents(sa.un.sun_path, 0755);
         (void) sockaddr_un_unlink(&sa.un);
@@ -1308,12 +1332,12 @@ static int manager_generate_key_pair(Manager *m) {
         /* Write out public key (note that we only do that as a help to the user, we don't make use of this ever */
         r = fopen_temporary("/var/lib/systemd/home/local.public", &fpublic, &temp_public);
         if (r < 0)
-                return log_error_errno(errno, "Failed ot open key file for writing: %m");
+                return log_error_errno(errno, "Failed to open key file for writing: %m");
 
         if (PEM_write_PUBKEY(fpublic, m->private_key) <= 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write public key.");
 
-        r = fflush_and_check(fpublic);
+        r = fflush_sync_and_check(fpublic);
         if (r < 0)
                 return log_error_errno(r, "Failed to write private key: %m");
 
@@ -1322,12 +1346,12 @@ static int manager_generate_key_pair(Manager *m) {
         /* Write out the private key (this actually writes out both private and public, OpenSSL is confusing) */
         r = fopen_temporary("/var/lib/systemd/home/local.private", &fprivate, &temp_private);
         if (r < 0)
-                return log_error_errno(errno, "Failed ot open key file for writing: %m");
+                return log_error_errno(errno, "Failed to open key file for writing: %m");
 
         if (PEM_write_PrivateKey(fprivate, m->private_key, NULL, NULL, 0, NULL, 0) <= 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write private key pair.");
 
-        r = fflush_and_check(fprivate);
+        r = fflush_sync_and_check(fprivate);
         if (r < 0)
                 return log_error_errno(r, "Failed to write private key: %m");
 
@@ -1341,9 +1365,13 @@ static int manager_generate_key_pair(Manager *m) {
 
         if (rename(temp_private, "/var/lib/systemd/home/local.private") < 0) {
                 (void) unlink_noerrno("/var/lib/systemd/home/local.public"); /* try to remove the file we already created */
-                return log_error_errno(errno, "Failed to move privtate key file into place: %m");
+                return log_error_errno(errno, "Failed to move private key file into place: %m");
         }
         temp_private = mfree(temp_private);
+
+        r = fsync_path_at(AT_FDCWD, "/var/lib/systemd/home/");
+        if (r < 0)
+                log_warning_errno(r, "Failed to sync /var/lib/systemd/home/, ignoring: %m");
 
         return 1;
 }
@@ -1657,11 +1685,11 @@ int manager_enqueue_gc(Manager *m, Home *focus) {
 
                 return 0;
         } else
-                m->gc_focus = focus; /* start focussed */
+                m->gc_focus = focus; /* start focused */
 
         r = sd_event_add_defer(m->event, &m->deferred_gc_event_source, on_deferred_gc, m);
         if (r < 0)
-                return log_error_errno(r, "Failed to allocate gc event source: %m");
+                return log_error_errno(r, "Failed to allocate GC event source: %m");
 
         r = sd_event_source_set_priority(m->deferred_gc_event_source, SD_EVENT_PRIORITY_IDLE);
         if (r < 0)

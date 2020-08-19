@@ -207,7 +207,7 @@ static int swap_add_device_dependencies(Swap *s) {
                 return 0;
 
         p = swap_get_parameters(s);
-        if (!p)
+        if (!p || !p->what)
                 return 0;
 
         mask = s->from_proc_swaps ? UNIT_DEPENDENCY_PROC_SWAP : UNIT_DEPENDENCY_FILE;
@@ -701,6 +701,7 @@ static void swap_enter_dead(Swap *s, SwapResult f) {
                 s->result = f;
 
         unit_log_result(UNIT(s), s->result == SWAP_SUCCESS, swap_result_to_string(s->result));
+        unit_warn_leftover_processes(UNIT(s), unit_log_leftover_process_stop);
         swap_set_state(s, s->result != SWAP_SUCCESS ? SWAP_FAILED : SWAP_DEAD);
 
         s->exec_runtime = exec_runtime_unref(s->exec_runtime, true);
@@ -724,9 +725,15 @@ static void swap_enter_active(Swap *s, SwapResult f) {
 static void swap_enter_dead_or_active(Swap *s, SwapResult f) {
         assert(s);
 
-        if (s->from_proc_swaps)
+        if (s->from_proc_swaps) {
+                Swap *other;
+
                 swap_enter_active(s, f);
-        else
+
+                LIST_FOREACH_OTHERS(same_devnode, other, s)
+                        if (UNIT(other)->job)
+                                swap_enter_dead_or_active(other, f);
+        } else
                 swap_enter_dead(s, f);
 }
 
@@ -782,7 +789,7 @@ static void swap_enter_activating(Swap *s) {
 
         assert(s);
 
-        unit_warn_leftover_processes(UNIT(s));
+        unit_warn_leftover_processes(UNIT(s), unit_log_leftover_process_start);
 
         s->control_command_id = SWAP_EXEC_ACTIVATE;
         s->control_command = s->exec_command + SWAP_EXEC_ACTIVATE;
@@ -1649,7 +1656,6 @@ const UnitVTable swap_vtable = {
 
         .control_pid = swap_control_pid,
 
-        .bus_vtable = bus_swap_vtable,
         .bus_set_property = bus_swap_set_property,
         .bus_commit_properties = bus_swap_commit_properties,
 

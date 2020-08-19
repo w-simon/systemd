@@ -189,6 +189,23 @@ typedef struct Pkcs11EncryptedKey {
         char *hashed_password;
 } Pkcs11EncryptedKey;
 
+typedef struct Fido2HmacCredential {
+        void *id;
+        size_t size;
+} Fido2HmacCredential;
+
+typedef struct Fido2HmacSalt {
+        /* The FIDO2 Cridential ID to use */
+        Fido2HmacCredential credential;
+
+        /* The FIDO2 salt value */
+        void *salt;
+        size_t salt_size;
+
+        /* What to test the hashed salt value against, usually UNIX password hash here. */
+        char *hashed_password;
+} Fido2HmacSalt;
+
 typedef struct UserRecord {
         /* The following three fields are not part of the JSON record */
         unsigned n_ref;
@@ -239,7 +256,7 @@ typedef struct UserRecord {
         char **hashed_password;
         char **ssh_authorized_keys;
         char **password;
-        char **pkcs11_pin;
+        char **token_pin;
 
         char *cifs_domain;
         char *cifs_user_name;
@@ -261,6 +278,7 @@ typedef struct UserRecord {
         sd_id128_t file_system_uuid;
 
         int luks_discard;
+        int luks_offline_discard;
         char *luks_cipher;
         char *luks_cipher_mode;
         uint64_t luks_volume_key_size;
@@ -308,6 +326,12 @@ typedef struct UserRecord {
         size_t n_pkcs11_encrypted_key;
         int pkcs11_protected_authentication_path_permitted;
 
+        Fido2HmacCredential *fido2_hmac_credential;
+        size_t n_fido2_hmac_credential;
+        Fido2HmacSalt *fido2_hmac_salt;
+        size_t n_fido2_hmac_salt;
+        int fido2_user_presence_permitted;
+
         JsonVariant *json;
 } UserRecord;
 
@@ -332,6 +356,7 @@ const char *user_record_cifs_user_name(UserRecord *h);
 const char *user_record_shell(UserRecord *h);
 const char *user_record_real_name(UserRecord *h);
 bool user_record_luks_discard(UserRecord *h);
+bool user_record_luks_offline_discard(UserRecord *h);
 const char *user_record_luks_cipher(UserRecord *h);
 const char *user_record_luks_cipher_mode(UserRecord *h);
 uint64_t user_record_luks_volume_key_size(UserRecord *h);
@@ -347,6 +372,8 @@ usec_t user_record_ratelimit_interval_usec(UserRecord *h);
 uint64_t user_record_ratelimit_burst(UserRecord *h);
 bool user_record_can_authenticate(UserRecord *h);
 
+int user_record_build_image_path(UserStorage storage, const char *user_name_and_realm, char **ret);
+
 bool user_record_equal(UserRecord *a, UserRecord *b);
 bool user_record_compatible(UserRecord *a, UserRecord *b);
 int user_record_compare_last_change(UserRecord *a, UserRecord *b);
@@ -361,6 +388,7 @@ int user_record_test_password_change_required(UserRecord *h);
 
 /* The following six are user by group-record.c, that's why we export them here */
 int json_dispatch_realm(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
+int json_dispatch_gecos(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
 int json_dispatch_user_group_list(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
 int json_dispatch_user_disposition(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
 

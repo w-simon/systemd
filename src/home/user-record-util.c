@@ -104,7 +104,7 @@ int user_record_synthesize(
 }
 
 int group_record_synthesize(GroupRecord *g, UserRecord *h) {
-        _cleanup_free_ char *un = NULL, *rr = NULL, *group_name_and_realm = NULL;
+        _cleanup_free_ char *un = NULL, *rr = NULL, *group_name_and_realm = NULL, *description = NULL;
         char smid[SD_ID128_STRING_MAX];
         sd_id128_t mid;
         int r;
@@ -133,10 +133,15 @@ int group_record_synthesize(GroupRecord *g, UserRecord *h) {
                         return -ENOMEM;
         }
 
+        description = strjoin("Primary Group of User ", un);
+        if (!description)
+                return -ENOMEM;
+
         r = json_build(&g->json,
                        JSON_BUILD_OBJECT(
                                        JSON_BUILD_PAIR("groupName", JSON_BUILD_STRING(un)),
                                        JSON_BUILD_PAIR_CONDITION(!!rr, "realm", JSON_BUILD_STRING(rr)),
+                                       JSON_BUILD_PAIR("description", JSON_BUILD_STRING(description)),
                                        JSON_BUILD_PAIR("binding", JSON_BUILD_OBJECT(
                                                                        JSON_BUILD_PAIR(sd_id128_to_string(mid, smid), JSON_BUILD_OBJECT(
                                                                                                        JSON_BUILD_PAIR("gid", JSON_BUILD_UNSIGNED(user_record_gid(h))))))),
@@ -172,7 +177,7 @@ int user_record_reconcile(
          *     -REMCHG: identity records are not about the same user
          *     -ESTALE: embedded identity record is equally new or newer than supplied record
          *
-         * Return the new record to use, which is either the the embedded record updated with the host
+         * Return the new record to use, which is either the embedded record updated with the host
          * binding or the host record. In both cases the secret data is stripped. */
 
         assert(host);
@@ -275,8 +280,8 @@ int user_record_add_binding(
                 gid_t gid) {
 
         _cleanup_(json_variant_unrefp) JsonVariant *new_binding_entry = NULL, *binding = NULL;
-        char smid[SD_ID128_STRING_MAX], partition_uuids[37], luks_uuids[37], fs_uuids[37];
-        _cleanup_free_ char *ip = NULL, *hd = NULL;
+        char smid[SD_ID128_STRING_MAX], partition_uuids[ID128_UUID_STRING_MAX], luks_uuids[ID128_UUID_STRING_MAX], fs_uuids[ID128_UUID_STRING_MAX];
+        _cleanup_free_ char *ip = NULL, *hd = NULL, *ip_auto = NULL, *lc = NULL, *lcm = NULL, *fst = NULL;
         sd_id128_t mid;
         int r;
 
@@ -294,11 +299,33 @@ int user_record_add_binding(
                 ip = strdup(image_path);
                 if (!ip)
                         return -ENOMEM;
+        } else if (!h->image_path && storage >= 0) {
+                r = user_record_build_image_path(storage, user_record_user_name_and_realm(h), &ip_auto);
+                if (r < 0)
+                        return r;
         }
 
         if (home_directory) {
                 hd = strdup(home_directory);
                 if (!hd)
+                        return -ENOMEM;
+        }
+
+        if (file_system_type) {
+                fst = strdup(file_system_type);
+                if (!fst)
+                        return -ENOMEM;
+        }
+
+        if (luks_cipher) {
+                lc = strdup(luks_cipher);
+                if (!lc)
+                        return -ENOMEM;
+        }
+
+        if (luks_cipher_mode) {
+                lcm = strdup(luks_cipher_mode);
+                if (!lcm)
                         return -ENOMEM;
         }
 
@@ -348,6 +375,8 @@ int user_record_add_binding(
 
         if (ip)
                 free_and_replace(h->image_path, ip);
+        if (ip_auto)
+                free_and_replace(h->image_path_auto, ip_auto);
 
         if (!sd_id128_is_null(partition_uuid))
                 h->partition_uuid = partition_uuid;
@@ -358,11 +387,22 @@ int user_record_add_binding(
         if (!sd_id128_is_null(fs_uuid))
                 h->file_system_uuid = fs_uuid;
 
+        if (lc)
+                free_and_replace(h->luks_cipher, lc);
+        if (lcm)
+                free_and_replace(h->luks_cipher_mode, lcm);
+        if (luks_volume_key_size != UINT64_MAX)
+                h->luks_volume_key_size = luks_volume_key_size;
+
+        if (fst)
+                free_and_replace(h->file_system_type, fst);
         if (hd)
                 free_and_replace(h->home_directory, hd);
 
         if (uid_is_valid(uid))
                 h->uid = uid;
+        if (gid_is_valid(gid))
+                h->gid = gid;
 
         h->mask |= USER_RECORD_BINDING;
         return 1;
@@ -460,7 +500,7 @@ int user_record_test_image_path(UserRecord *h) {
                 if (S_ISBLK(st.st_mode)) {
                         /* For block devices we can't really be sure if the device referenced actually is the
                          * fs we look for or some other file system (think: what does /dev/sdb1 refer
-                         * to?). Hence, let's return USER_TEST_MAYBE as an ambigious return value for these
+                         * to?). Hence, let's return USER_TEST_MAYBE as an ambiguous return value for these
                          * case, except if the device path used is one of the paths that is based on a
                          * filesystem or partition UUID or label, because in those cases we can be sure we
                          * are referring to the right device. */
@@ -840,6 +880,8 @@ int user_record_set_password(UserRecord *h, char **password, bool prepend) {
         if (r < 0)
                 return r;
 
+        json_variant_sensitive(w);
+
         r = json_variant_set_field(&h->json, "secret", w);
         if (r < 0)
                 return r;
@@ -850,7 +892,7 @@ int user_record_set_password(UserRecord *h, char **password, bool prepend) {
         return 0;
 }
 
-int user_record_set_pkcs11_pin(UserRecord *h, char **pin, bool prepend) {
+int user_record_set_token_pin(UserRecord *h, char **pin, bool prepend) {
         _cleanup_(json_variant_unrefp) JsonVariant *w = NULL;
         _cleanup_(strv_free_erasep) char **e = NULL;
         int r;
@@ -862,17 +904,17 @@ int user_record_set_pkcs11_pin(UserRecord *h, char **pin, bool prepend) {
                 if (!e)
                         return -ENOMEM;
 
-                r = strv_extend_strv(&e, h->pkcs11_pin, true);
+                r = strv_extend_strv(&e, h->token_pin, true);
                 if (r < 0)
                         return r;
 
                 strv_uniq(e);
 
-                if (strv_equal(h->pkcs11_pin, e))
+                if (strv_equal(h->token_pin, e))
                         return 0;
 
         } else {
-                if (strv_equal(h->pkcs11_pin, pin))
+                if (strv_equal(h->token_pin, pin))
                         return 0;
 
                 e = strv_copy(pin);
@@ -885,7 +927,7 @@ int user_record_set_pkcs11_pin(UserRecord *h, char **pin, bool prepend) {
         w = json_variant_ref(json_variant_by_key(h->json, "secret"));
 
         if (strv_isempty(e))
-                r = json_variant_filter(&w, STRV_MAKE("pkcs11Pin"));
+                r = json_variant_filter(&w, STRV_MAKE("tokenPin"));
         else {
                 _cleanup_(json_variant_unrefp) JsonVariant *l = NULL;
 
@@ -895,16 +937,18 @@ int user_record_set_pkcs11_pin(UserRecord *h, char **pin, bool prepend) {
 
                 json_variant_sensitive(l);
 
-                r = json_variant_set_field(&w, "pkcs11Pin", l);
+                r = json_variant_set_field(&w, "tokenPin", l);
         }
         if (r < 0)
                 return r;
+
+        json_variant_sensitive(w);
 
         r = json_variant_set_field(&h->json, "secret", w);
         if (r < 0)
                 return r;
 
-        strv_free_and_replace(h->pkcs11_pin, e);
+        strv_free_and_replace(h->token_pin, e);
 
         SET_FLAG(h->mask, USER_RECORD_SECRET, !json_variant_is_blank_object(w));
         return 0;
@@ -927,12 +971,43 @@ int user_record_set_pkcs11_protected_authentication_path_permitted(UserRecord *h
 
         if (json_variant_is_blank_object(w))
                 r = json_variant_filter(&h->json, STRV_MAKE("secret"));
+        else {
+                json_variant_sensitive(w);
+
+                r = json_variant_set_field(&h->json, "secret", w);
+        }
+        if (r < 0)
+                return r;
+
+        h->pkcs11_protected_authentication_path_permitted = b;
+
+        SET_FLAG(h->mask, USER_RECORD_SECRET, !json_variant_is_blank_object(w));
+        return 0;
+}
+
+int user_record_set_fido2_user_presence_permitted(UserRecord *h, int b) {
+        _cleanup_(json_variant_unrefp) JsonVariant *w = NULL;
+        int r;
+
+        assert(h);
+
+        w = json_variant_ref(json_variant_by_key(h->json, "secret"));
+
+        if (b < 0)
+                r = json_variant_filter(&w, STRV_MAKE("fido2UserPresencePermitted"));
+        else
+                r = json_variant_set_field_boolean(&w, "fido2UserPresencePermitted", b);
+        if (r < 0)
+                return r;
+
+        if (json_variant_is_blank_object(w))
+                r = json_variant_filter(&h->json, STRV_MAKE("secret"));
         else
                 r = json_variant_set_field(&h->json, "secret", w);
         if (r < 0)
                 return r;
 
-        h->pkcs11_protected_authentication_path_permitted = b;
+        h->fido2_user_presence_permitted = b;
 
         SET_FLAG(h->mask, USER_RECORD_SECRET, !json_variant_is_blank_object(w));
         return 0;
@@ -1020,12 +1095,22 @@ int user_record_merge_secret(UserRecord *h, UserRecord *secret) {
         if (r < 0)
                 return r;
 
-        r = user_record_set_pkcs11_pin(h, secret->pkcs11_pin, true);
+        r = user_record_set_token_pin(h, secret->token_pin, true);
         if (r < 0)
                 return r;
 
         if (secret->pkcs11_protected_authentication_path_permitted >= 0) {
-                r = user_record_set_pkcs11_protected_authentication_path_permitted(h, secret->pkcs11_protected_authentication_path_permitted);
+                r = user_record_set_pkcs11_protected_authentication_path_permitted(
+                                h,
+                                secret->pkcs11_protected_authentication_path_permitted);
+                if (r < 0)
+                        return r;
+        }
+
+        if (secret->fido2_user_presence_permitted >= 0) {
+                r = user_record_set_fido2_user_presence_permitted(
+                                h,
+                                secret->fido2_user_presence_permitted);
                 if (r < 0)
                         return r;
         }

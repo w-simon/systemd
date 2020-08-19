@@ -193,6 +193,8 @@ const UnitVTable target_vtable = {
                 "Target\0"
                 "Install\0",
 
+        .can_fail = true,
+
         .load = target_load,
         .coldplug = target_coldplug,
 
@@ -206,8 +208,6 @@ const UnitVTable target_vtable = {
 
         .active_state = target_active_state,
         .sub_state_to_string = target_sub_state_to_string,
-
-        .bus_vtable = bus_target_vtable,
 
         .status_message_formats = {
                 .finished_start_job = {

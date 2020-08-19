@@ -8,11 +8,15 @@
 typedef struct NamespaceInfo NamespaceInfo;
 typedef struct BindMount BindMount;
 typedef struct TemporaryFileSystem TemporaryFileSystem;
+typedef struct MountImage MountImage;
+typedef struct MountEntry MountEntry;
 
 #include <stdbool.h>
 
 #include "dissect-image.h"
+#include "fs-util.h"
 #include "macro.h"
+#include "string-util.h"
 
 typedef enum ProtectHome {
         PROTECT_HOME_NO,
@@ -70,9 +74,16 @@ struct TemporaryFileSystem {
         char *options;
 };
 
+struct MountImage {
+        char *source;
+        char *destination;
+        bool ignore_enoent;
+};
+
 int setup_namespace(
                 const char *root_directory,
                 const char *root_image,
+                const MountOptions *root_image_options,
                 const NamespaceInfo *ns_info,
                 char **read_write_paths,
                 char **read_only_paths,
@@ -82,14 +93,33 @@ int setup_namespace(
                 size_t n_bind_mounts,
                 const TemporaryFileSystem *temporary_filesystems,
                 size_t n_temporary_filesystems,
+                const MountImage *mount_images,
+                size_t n_mount_images,
                 const char *tmp_dir,
                 const char *var_tmp_dir,
                 const char *log_namespace,
                 ProtectHome protect_home,
                 ProtectSystem protect_system,
                 unsigned long mount_flags,
+                const void *root_hash,
+                size_t root_hash_size,
+                const char *root_hash_path,
+                const void *root_hash_sig,
+                size_t root_hash_sig_size,
+                const char *root_hash_sig_path,
+                const char *root_verity,
                 DissectImageFlags dissected_image_flags,
                 char **error_path);
+
+#define RUN_SYSTEMD_EMPTY "/run/systemd/empty"
+
+static inline void namespace_cleanup_tmpdir(char *p) {
+        PROTECT_ERRNO;
+        if (!streq_ptr(p, RUN_SYSTEMD_EMPTY))
+                (void) rmdir(p);
+        free(p);
+}
+DEFINE_TRIVIAL_CLEANUP_FUNC(char*, namespace_cleanup_tmpdir);
 
 int setup_tmp_dirs(
                 const char *id,
@@ -111,6 +141,9 @@ int bind_mount_add(BindMount **b, size_t *n, const BindMount *item);
 void temporary_filesystem_free_many(TemporaryFileSystem *t, size_t n);
 int temporary_filesystem_add(TemporaryFileSystem **t, size_t *n,
                              const char *path, const char *options);
+
+MountImage* mount_image_free_many(MountImage *m, size_t *n);
+int mount_image_add(MountImage **m, size_t *n, const MountImage *item);
 
 const char* namespace_type_to_string(NamespaceType t) _const_;
 NamespaceType namespace_type_from_string(const char *s) _pure_;

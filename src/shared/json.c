@@ -253,10 +253,9 @@ static JsonVariant *json_variant_formalize(JsonVariant *v) {
                 return json_variant_unsigned(v) == 0 ? JSON_VARIANT_MAGIC_ZERO_UNSIGNED : v;
 
         case JSON_VARIANT_REAL:
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wfloat-equal"
+                DISABLE_WARNING_FLOAT_EQUAL;
                 return json_variant_real(v) == 0.0 ? JSON_VARIANT_MAGIC_ZERO_REAL : v;
-#pragma GCC diagnostic pop
+                REENABLE_WARNING;
 
         case JSON_VARIANT_STRING:
                 return isempty(json_variant_string(v)) ? JSON_VARIANT_MAGIC_EMPTY_STRING : v;
@@ -353,13 +352,12 @@ int json_variant_new_real(JsonVariant **ret, long double d) {
 
         assert_return(ret, -EINVAL);
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wfloat-equal"
+        DISABLE_WARNING_FLOAT_EQUAL;
         if (d == 0.0) {
-#pragma GCC diagnostic pop
                 *ret = JSON_VARIANT_MAGIC_ZERO_REAL;
                 return 0;
         }
+        REENABLE_WARNING;
 
         r = json_variant_new(&v, JSON_VARIANT_REAL, sizeof(d));
         if (r < 0)
@@ -430,6 +428,12 @@ int json_variant_new_base64(JsonVariant **ret, const void *p, size_t n) {
                 return k;
 
         return json_variant_new_stringn(ret, s, k);
+}
+
+int json_variant_new_id128(JsonVariant **ret, sd_id128_t id) {
+        char s[SD_ID128_STRING_MAX];
+
+        return json_variant_new_string(ret, sd_id128_to_string(id, s));
 }
 
 static void json_variant_set(JsonVariant *a, JsonVariant *b) {
@@ -896,11 +900,10 @@ intmax_t json_variant_integer(JsonVariant *v) {
 
                 converted = (intmax_t) v->value.real;
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wfloat-equal"
+                DISABLE_WARNING_FLOAT_EQUAL;
                 if ((long double) converted == v->value.real)
-#pragma GCC diagnostic pop
                         return converted;
+                REENABLE_WARNING;
 
                 log_debug("Real %Lg requested as integer, and cannot be converted losslessly, returning 0.", v->value.real);
                 return 0;
@@ -944,11 +947,10 @@ uintmax_t json_variant_unsigned(JsonVariant *v) {
 
                 converted = (uintmax_t) v->value.real;
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wfloat-equal"
+                DISABLE_WARNING_FLOAT_EQUAL;
                 if ((long double) converted == v->value.real)
-#pragma GCC diagnostic pop
                         return converted;
+                REENABLE_WARNING;
 
                 log_debug("Real %Lg requested as unsigned integer, and cannot be converted losslessly, returning 0.", v->value.real);
                 return 0;
@@ -1097,8 +1099,11 @@ JsonVariantType json_variant_type(JsonVariant *v) {
         return v->type;
 }
 
-bool json_variant_has_type(JsonVariant *v, JsonVariantType type) {
+_function_no_sanitize_float_cast_overflow_ bool json_variant_has_type(JsonVariant *v, JsonVariantType type) {
         JsonVariantType rt;
+
+        /* Note: we turn off ubsan float cast overflo detection for this function, since it would complain
+         * about our float casts but we do them explicitly to detect conversion errors. */
 
         v = json_variant_dereference(v);
         if (!v)
@@ -1137,14 +1142,15 @@ bool json_variant_has_type(JsonVariant *v, JsonVariantType type) {
         if (rt == JSON_VARIANT_UNSIGNED && type == JSON_VARIANT_REAL)
                 return (uintmax_t) (long double) v->value.unsig == v->value.unsig;
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wfloat-equal"
+        DISABLE_WARNING_FLOAT_EQUAL;
+
         /* Any real that can be converted losslessly to an integer and back may also be considered an integer */
         if (rt == JSON_VARIANT_REAL && type == JSON_VARIANT_INTEGER)
                 return (long double) (intmax_t) v->value.real == v->value.real;
         if (rt == JSON_VARIANT_REAL && type == JSON_VARIANT_UNSIGNED)
                 return (long double) (uintmax_t) v->value.real == v->value.real;
-#pragma GCC diagnostic pop
+
+        REENABLE_WARNING;
 
         return false;
 }
@@ -1298,10 +1304,9 @@ bool json_variant_equal(JsonVariant *a, JsonVariant *b) {
                 return json_variant_unsigned(a) == json_variant_unsigned(b);
 
         case JSON_VARIANT_REAL:
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wfloat-equal"
+                DISABLE_WARNING_FLOAT_EQUAL;
                 return json_variant_real(a) == json_variant_real(b);
-#pragma GCC diagnostic pop
+                REENABLE_WARNING;
 
         case JSON_VARIANT_BOOLEAN:
                 return json_variant_boolean(a) == json_variant_boolean(b);
@@ -1381,7 +1386,7 @@ void json_variant_sensitive(JsonVariant *v) {
 
         /* Marks a variant as "sensitive", so that it is erased from memory when it is destroyed. This is a
          * one-way operation: as soon as it is marked this way it remains marked this way until it's
-         * destoryed. A magic variant is never sensitive though, even when asked, since it's too
+         * destroyed. A magic variant is never sensitive though, even when asked, since it's too
          * basic. Similar, const string variant are never sensitive either, after all they are included in
          * the source code as they are, which is not suitable for inclusion of secrets.
          *
@@ -1394,6 +1399,19 @@ void json_variant_sensitive(JsonVariant *v) {
                 return;
 
         v->sensitive = true;
+}
+
+bool json_variant_is_sensitive(JsonVariant *v) {
+        v = json_variant_formalize(v);
+        if (!json_variant_is_regular(v))
+                return false;
+
+        return v->sensitive;
+}
+
+static void json_variant_propagate_sensitive(JsonVariant *from, JsonVariant *to) {
+        if (json_variant_is_sensitive(from))
+                json_variant_sensitive(to);
 }
 
 int json_variant_get_source(JsonVariant *v, const char **ret_source, unsigned *ret_line, unsigned *ret_column) {
@@ -1829,6 +1847,8 @@ int json_variant_filter(JsonVariant **v, char **to_remove) {
         if (r < 0)
                 return r;
 
+        json_variant_propagate_sensitive(*v, w);
+
         json_variant_unref(*v);
         *v = TAKE_PTR(w);
 
@@ -1898,6 +1918,8 @@ int json_variant_set_field(JsonVariant **v, const char *field, JsonVariant *valu
         if (r < 0)
                 return r;
 
+        json_variant_propagate_sensitive(*v, w);
+
         json_variant_unref(*v);
         *v = TAKE_PTR(w);
 
@@ -1942,6 +1964,17 @@ int json_variant_set_field_boolean(JsonVariant **v, const char *field, bool b) {
         int r;
 
         r = json_variant_new_boolean(&m, b);
+        if (r < 0)
+                return r;
+
+        return json_variant_set_field(v, field, m);
+}
+
+int json_variant_set_field_strv(JsonVariant **v, const char *field, char **l) {
+        _cleanup_(json_variant_unrefp) JsonVariant *m = NULL;
+        int r;
+
+        r = json_variant_new_array_strv(&m, l);
         if (r < 0)
                 return r;
 
@@ -2005,6 +2038,9 @@ int json_variant_merge(JsonVariant **v, JsonVariant *m) {
         if (r < 0)
                 return r;
 
+        json_variant_propagate_sensitive(*v, w);
+        json_variant_propagate_sensitive(m, w);
+
         json_variant_unref(*v);
         *v = TAKE_PTR(w);
 
@@ -2044,9 +2080,10 @@ int json_variant_append_array(JsonVariant **v, JsonVariant *element) {
 
                 r = json_variant_new_array(&nv, array, i + 1);
         }
-
         if (r < 0)
                 return r;
+
+        json_variant_propagate_sensitive(*v, nv);
 
         json_variant_unref(*v);
         *v = TAKE_PTR(nv);
@@ -2192,6 +2229,8 @@ static int json_variant_copy(JsonVariant **nv, JsonVariant *v) {
         c->type = t;
 
         memcpy_safe(&c->value, source, k);
+
+        json_variant_propagate_sensitive(v, c);
 
         *nv = c;
         return 0;
@@ -3557,6 +3596,34 @@ int json_buildv(JsonVariant **ret, va_list ap) {
                         break;
                 }
 
+                case _JSON_BUILD_ID128: {
+                        sd_id128_t id;
+
+                        if (!IN_SET(current->expect, EXPECT_TOPLEVEL, EXPECT_OBJECT_VALUE, EXPECT_ARRAY_ELEMENT)) {
+                                r = -EINVAL;
+                                goto finish;
+                        }
+
+                        id = va_arg(ap, sd_id128_t);
+
+                        if (current->n_suppress == 0) {
+                                r = json_variant_new_id128(&add, id);
+                                if (r < 0)
+                                        goto finish;
+                        }
+
+                        n_subtract = 1;
+
+                        if (current->expect == EXPECT_TOPLEVEL)
+                                current->expect = EXPECT_END;
+                        else if (current->expect == EXPECT_OBJECT_VALUE)
+                                current->expect = EXPECT_OBJECT_KEY;
+                        else
+                                assert(current->expect == EXPECT_ARRAY_ELEMENT);
+
+                        break;
+                }
+
                 case _JSON_BUILD_OBJECT_BEGIN:
 
                         if (!IN_SET(current->expect, EXPECT_TOPLEVEL, EXPECT_OBJECT_VALUE, EXPECT_ARRAY_ELEMENT)) {
@@ -4072,10 +4139,9 @@ int json_dispatch_uid_gid(const char *name, JsonVariant *variant, JsonDispatchFl
         assert_cc(sizeof(uid_t) == sizeof(uint32_t));
         assert_cc(sizeof(gid_t) == sizeof(uint32_t));
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wtype-limits"
+        DISABLE_WARNING_TYPE_LIMITS;
         assert_cc(((uid_t) -1 < (uid_t) 0) == ((gid_t) -1 < (gid_t) 0));
-#pragma GCC diagnostic pop
+        REENABLE_WARNING;
 
         if (json_variant_is_null(variant)) {
                 *uid = UID_INVALID;
@@ -4107,7 +4173,7 @@ int json_dispatch_user_group_name(const char *name, JsonVariant *variant, JsonDi
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a string.", strna(name));
 
         n = json_variant_string(variant);
-        if (!valid_user_group_name(n))
+        if (!valid_user_group_name(n, FLAGS_SET(flags, JSON_RELAX) ? VALID_USER_RELAX : 0))
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a valid user/group name.", strna(name));
 
         r = free_and_strdup(s, n);
@@ -4178,6 +4244,9 @@ int json_variant_sort(JsonVariant **v) {
         r = json_variant_new_object(&n, a, m);
         if (r < 0)
                 return r;
+
+        json_variant_propagate_sensitive(*v, n);
+
         if (!n->sorted) /* Check if this worked. This will fail if there are multiple identical keys used. */
                 return -ENOTUNIQ;
 
@@ -4226,6 +4295,9 @@ int json_variant_normalize(JsonVariant **v) {
         }
         if (r < 0)
                 goto finish;
+
+        json_variant_propagate_sensitive(*v, n);
+
         if (!n->normalized) { /* Let's see if normalization worked. It will fail if there are multiple
                                * identical keys used in the same object anywhere, or if there are floating
                                * point numbers used (see below) */

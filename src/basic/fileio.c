@@ -22,6 +22,7 @@
 #include "mkdir.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "socket-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
 #include "tmpfile-util.h"
@@ -54,6 +55,44 @@ int fdopen_unlocked(int fd, const char *options, FILE **ret) {
         return 0;
 }
 
+int take_fdopen_unlocked(int *fd, const char *options, FILE **ret) {
+        int     r;
+
+        assert(fd);
+
+        r = fdopen_unlocked(*fd, options, ret);
+        if (r < 0)
+                return r;
+
+        *fd = -1;
+
+        return 0;
+}
+
+FILE* take_fdopen(int *fd, const char *options) {
+        assert(fd);
+
+        FILE *f = fdopen(*fd, options);
+        if (!f)
+                return NULL;
+
+        *fd = -1;
+
+        return f;
+}
+
+DIR* take_fdopendir(int *dfd) {
+        assert(dfd);
+
+        DIR *d = fdopendir(*dfd);
+        if (!d)
+                return NULL;
+
+        *dfd = -1;
+
+        return d;
+}
+
 FILE* open_memstream_unlocked(char **ptr, size_t *sizeloc) {
         FILE *f = open_memstream(ptr, sizeloc);
         if (!f)
@@ -81,13 +120,21 @@ int write_string_stream_ts(
                 struct timespec *ts) {
 
         bool needs_nl;
-        int r;
+        int r, fd;
 
         assert(f);
         assert(line);
 
         if (ferror(f))
                 return -EIO;
+
+        if (ts) {
+                /* If we shall set the timestamp we need the fd. But fmemopen() streams generally don't have
+                 * an fd. Let's fail early in that case. */
+                fd = fileno(f);
+                if (fd < 0)
+                        return -EBADF;
+        }
 
         needs_nl = !(flags & WRITE_STRING_FILE_AVOID_NEWLINE) && !endswith(line, "\n");
 
@@ -116,7 +163,7 @@ int write_string_stream_ts(
         if (ts) {
                 struct timespec twice[2] = {*ts, *ts};
 
-                if (futimens(fileno(f), twice) < 0)
+                if (futimens(fd, twice) < 0)
                         return -errno;
         }
 
@@ -154,6 +201,13 @@ static int write_string_file_atomic(
         if (rename(p, fn) < 0) {
                 r = -errno;
                 goto fail;
+        }
+
+        if (FLAGS_SET(flags, WRITE_STRING_FILE_SYNC)) {
+                /* Sync the rename, too */
+                r = fsync_directory_of_file(fileno(f));
+                if (r < 0)
+                        return r;
         }
 
         return 0;
@@ -373,7 +427,7 @@ int read_full_virtual_file(const char *filename, char **ret_contents, size_t *re
                                 break;
                         }
 
-                        if (errno != -EINTR)
+                        if (errno != EINTR)
                                 return -errno;
                 }
 
@@ -429,13 +483,12 @@ int read_full_stream_full(
         assert(f);
         assert(ret_contents);
         assert(!FLAGS_SET(flags, READ_FULL_FILE_UNBASE64 | READ_FULL_FILE_UNHEX));
-        assert(!(flags & (READ_FULL_FILE_UNBASE64 | READ_FULL_FILE_UNHEX)) || ret_size);
 
         n_next = LINE_MAX; /* Start size */
 
         fd = fileno(f);
-        if (fd >= 0) { /* If the FILE* object is backed by an fd (as opposed to memory or such, see fmemopen(), let's
-                        * optimize our buffering) */
+        if (fd >= 0) { /* If the FILE* object is backed by an fd (as opposed to memory or such, see fmemopen()), let's
+                        * optimize our buffering */
 
                 if (fstat(fd, &st) < 0)
                         return -errno;
@@ -452,7 +505,7 @@ int read_full_stream_full(
                         if (st.st_size > 0)
                                 n_next = st.st_size + 1;
 
-                        if (flags & READ_FULL_FILE_SECURE)
+                        if (flags & READ_FULL_FILE_WARN_WORLD_READABLE)
                                 (void) warn_file_is_world_accessible(filename, &st, NULL, 0);
                 }
         }
@@ -482,21 +535,18 @@ int read_full_stream_full(
 
                 errno = 0;
                 k = fread(buf + l, 1, n - l, f);
-                if (k > 0)
-                        l += k;
+
+                assert(k <= n - l);
+                l += k;
 
                 if (ferror(f)) {
                         r = errno_or_else(EIO);
                         goto finalize;
                 }
-
                 if (feof(f))
                         break;
 
-                /* We aren't expecting fread() to return a short read outside
-                 * of (error && eof), assert buffer is full and enlarge buffer.
-                 */
-                assert(l == n);
+                assert(k > 0); /* we can't have read zero bytes because that would have been EOF */
 
                 /* Safety check */
                 if (n >= READ_FULL_BYTES_MAX) {
@@ -508,12 +558,21 @@ int read_full_stream_full(
         }
 
         if (flags & (READ_FULL_FILE_UNBASE64 | READ_FULL_FILE_UNHEX)) {
+                _cleanup_free_ void *decoded = NULL;
+                size_t decoded_size;
+
                 buf[l++] = 0;
                 if (flags & READ_FULL_FILE_UNBASE64)
-                        r = unbase64mem_full(buf, l, flags & READ_FULL_FILE_SECURE, (void **) ret_contents, ret_size);
+                        r = unbase64mem_full(buf, l, flags & READ_FULL_FILE_SECURE, &decoded, &decoded_size);
                 else
-                        r = unhexmem_full(buf, l, flags & READ_FULL_FILE_SECURE, (void **) ret_contents, ret_size);
-                goto finalize;
+                        r = unhexmem_full(buf, l, flags & READ_FULL_FILE_SECURE, &decoded, &decoded_size);
+                if (r < 0)
+                        goto finalize;
+
+                if (flags & READ_FULL_FILE_SECURE)
+                        explicit_bzero_safe(buf, n);
+                free_and_replace(buf, decoded);
+                n = l = decoded_size;
         }
 
         if (!ret_size) {
@@ -550,8 +609,54 @@ int read_full_file_full(int dir_fd, const char *filename, ReadFullFileFlags flag
         assert(contents);
 
         r = xfopenat(dir_fd, filename, "re", 0, &f);
-        if (r < 0)
-                return r;
+        if (r < 0) {
+                _cleanup_close_ int dfd = -1, sk = -1;
+                union sockaddr_union sa;
+
+                /* ENXIO is what Linux returns if we open a node that is an AF_UNIX socket */
+                if (r != -ENXIO)
+                        return r;
+
+                /* If this is enabled, let's try to connect to it */
+                if (!FLAGS_SET(flags, READ_FULL_FILE_CONNECT_SOCKET))
+                        return -ENXIO;
+
+                if (dir_fd == AT_FDCWD)
+                        r = sockaddr_un_set_path(&sa.un, filename);
+                else {
+                        char procfs_path[STRLEN("/proc/self/fd/") + DECIMAL_STR_MAX(int)];
+
+                        /* If we shall operate relative to some directory, then let's use O_PATH first to
+                         * open the socket inode, and then connect to it via /proc/self/fd/. We have to do
+                         * this since there's not connectat() that takes a directory fd as first arg. */
+
+                        dfd = openat(dir_fd, filename, O_PATH|O_CLOEXEC);
+                        if (dfd < 0)
+                                return -errno;
+
+                        xsprintf(procfs_path, "/proc/self/fd/%i", dfd);
+                        r = sockaddr_un_set_path(&sa.un, procfs_path);
+                }
+                if (r < 0)
+                        return r;
+
+                sk = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
+                if (sk < 0)
+                        return -errno;
+
+                if (connect(sk, &sa.sa, SOCKADDR_UN_LEN(sa.un)) < 0)
+                        return errno == ENOTSOCK ? -ENXIO : -errno; /* propagate original error if this is
+                                                                     * not a socket after all */
+
+                if (shutdown(sk, SHUT_WR) < 0)
+                        return -errno;
+
+                f = fdopen(sk, "r");
+                if (!f)
+                        return -errno;
+
+                TAKE_FD(sk);
+        }
 
         (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
 
@@ -848,7 +953,7 @@ int fflush_and_check(FILE *f) {
 }
 
 int fflush_sync_and_check(FILE *f) {
-        int r;
+        int r, fd;
 
         assert(f);
 
@@ -856,10 +961,16 @@ int fflush_sync_and_check(FILE *f) {
         if (r < 0)
                 return r;
 
-        if (fsync(fileno(f)) < 0)
+        /* Not all file streams have an fd associated (think: fmemopen()), let's handle this gracefully and
+         * assume that in that case we need no explicit syncing */
+        fd = fileno(f);
+        if (fd < 0)
+                return 0;
+
+        if (fsync(fd) < 0)
                 return -errno;
 
-        r = fsync_directory_of_file(fileno(f));
+        r = fsync_directory_of_file(fd);
         if (r < 0)
                 return r;
 
@@ -957,7 +1068,7 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(FILE*, funlockfile);
 int read_line_full(FILE *f, size_t limit, ReadLineFlags flags, char **ret) {
         size_t n = 0, allocated = 0, count = 0;
         _cleanup_free_ char *buffer = NULL;
-        int r, tty = -1;
+        int r;
 
         assert(f);
 
@@ -1032,13 +1143,23 @@ int read_line_full(FILE *f, size_t limit, ReadLineFlags flags, char **ret) {
                         count++;
 
                         if (eol != EOL_NONE) {
-                                /* If we are on a tty, we can't wait for more input. But we expect only
-                                 * \n as the single EOL marker, so there is no need to wait. We check
-                                 * this condition last to avoid isatty() check if not necessary. */
+                                /* If we are on a tty, we can't shouldn't wait for more input, because that
+                                 * generally means waiting for the user, interactively. In the case of a TTY
+                                 * we expect only \n as the single EOL marker, so we are in the lucky
+                                 * position that there is no need to wait. We check this condition last, to
+                                 * avoid isatty() check if not necessary. */
 
-                                if (tty < 0)
-                                        tty = isatty(fileno(f));
-                                if (tty > 0)
+                                if ((flags & (READ_LINE_IS_A_TTY|READ_LINE_NOT_A_TTY)) == 0) {
+                                        int fd;
+
+                                        fd = fileno(f);
+                                        if (fd < 0) /* Maybe an fmemopen() stream? Handle this gracefully,
+                                                     * and don't call isatty() on an invalid fd */
+                                                flags |= READ_LINE_NOT_A_TTY;
+                                        else
+                                                flags |= isatty(fd) ? READ_LINE_IS_A_TTY : READ_LINE_NOT_A_TTY;
+                                }
+                                if (FLAGS_SET(flags, READ_LINE_IS_A_TTY))
                                         break;
                         }
 
@@ -1117,4 +1238,26 @@ int warn_file_is_world_accessible(const char *filename, struct stat *st, const c
                 log_warning("%s has %04o mode that is too permissive, please adjust the ownership and access mode.",
                             filename, st->st_mode & 07777);
         return 0;
+}
+
+int sync_rights(int from, int to) {
+        struct stat st;
+
+        if (fstat(from, &st) < 0)
+                return -errno;
+
+        return fchmod_and_chown(to, st.st_mode & 07777, st.st_uid, st.st_gid);
+}
+
+int rename_and_apply_smack_floor_label(const char *from, const char *to) {
+        int r = 0;
+        if (rename(from, to) < 0)
+                return -errno;
+
+#ifdef SMACK_RUN_LABEL
+        r = mac_smack_apply(to, SMACK_ATTR_ACCESS, SMACK_FLOOR_LABEL);
+        if (r < 0)
+                return r;
+#endif
+        return r;
 }

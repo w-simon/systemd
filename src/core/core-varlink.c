@@ -136,6 +136,7 @@ static int build_group_json(const char *group_name, gid_t gid, JsonVariant **ret
         return json_build(ret, JSON_BUILD_OBJECT(
                                    JSON_BUILD_PAIR("record", JSON_BUILD_OBJECT(
                                        JSON_BUILD_PAIR("groupName", JSON_BUILD_STRING(group_name)),
+                                       JSON_BUILD_PAIR("description", JSON_BUILD_STRING("Dynamic Group")),
                                        JSON_BUILD_PAIR("gid", JSON_BUILD_UNSIGNED(gid)),
                                        JSON_BUILD_PAIR("service", JSON_BUILD_STRING("io.systemd.DynamicUser")),
                                        JSON_BUILD_PAIR("disposition", JSON_BUILD_STRING("dynamic"))))));
@@ -289,11 +290,13 @@ int manager_varlink_init(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to register varlink methods: %m");
 
-        (void) mkdir_p("/run/systemd/userdb", 0755);
+        if (!MANAGER_IS_TEST_RUN(m)) {
+                (void) mkdir_p("/run/systemd/userdb", 0755);
 
-        r = varlink_server_listen_address(s, "/run/systemd/userdb/io.systemd.DynamicUser", 0666);
-        if (r < 0)
-                return log_error_errno(r, "Failed to bind to varlink socket: %m");
+                r = varlink_server_listen_address(s, "/run/systemd/userdb/io.systemd.DynamicUser", 0666);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to bind to varlink socket: %m");
+        }
 
         r = varlink_server_attach_event(s, m->event, SD_EVENT_PRIORITY_NORMAL);
         if (r < 0)

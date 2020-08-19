@@ -41,6 +41,7 @@ typedef struct Spawn {
         pid_t pid;
         usec_t timeout_warn_usec;
         usec_t timeout_usec;
+        int timeout_signal;
         usec_t event_birth_usec;
         bool accept_failure;
         int fd_stdout;
@@ -369,7 +370,7 @@ static ssize_t udev_event_subst_format(
         }
         case FORMAT_SUBST_PARENT:
                 r = sd_device_get_parent(dev, &parent);
-                if (r == -ENODEV)
+                if (r == -ENOENT)
                         goto null_terminate;
                 if (r < 0)
                         return r;
@@ -436,9 +437,9 @@ null_terminate:
         return 0;
 }
 
-ssize_t udev_event_apply_format(UdevEvent *event,
-                                const char *src, char *dest, size_t size,
-                                bool replace_whitespace) {
+size_t udev_event_apply_format(UdevEvent *event,
+                               const char *src, char *dest, size_t size,
+                               bool replace_whitespace) {
         const char *s = src;
         int r;
 
@@ -454,9 +455,10 @@ ssize_t udev_event_apply_format(UdevEvent *event,
                 ssize_t subst_len;
 
                 r = get_subst_type(&s, false, &type, attr);
-                if (r < 0)
-                        return log_device_warning_errno(event->dev, r, "Invalid format string, ignoring: %s", src);
-                if (r == 0) {
+                if (r < 0) {
+                        log_device_warning_errno(event->dev, r, "Invalid format string, ignoring: %s", src);
+                        break;
+                } else if (r == 0) {
                         if (size < 2) /* need space for this char and the terminating NUL */
                                 break;
                         *dest++ = *s++;
@@ -465,10 +467,12 @@ ssize_t udev_event_apply_format(UdevEvent *event,
                 }
 
                 subst_len = udev_event_subst_format(event, type, attr, dest, size);
-                if (subst_len < 0)
-                        return log_device_warning_errno(event->dev, subst_len,
-                                                        "Failed to substitute variable '$%s' or apply format '%%%c', ignoring: %m",
-                                                        format_type_to_string(type), format_type_to_char(type));
+                if (subst_len < 0) {
+                        log_device_warning_errno(event->dev, subst_len,
+                                                 "Failed to substitute variable '$%s' or apply format '%%%c', ignoring: %m",
+                                                 format_type_to_string(type), format_type_to_char(type));
+                        break;
+                }
 
                 /* FORMAT_SUBST_RESULT handles spaces itself */
                 if (replace_whitespace && type != FORMAT_SUBST_RESULT)
@@ -596,7 +600,7 @@ static int on_spawn_timeout(sd_event_source *s, uint64_t usec, void *userdata) {
 
         assert(spawn);
 
-        kill_and_sigcont(spawn->pid, SIGKILL);
+        kill_and_sigcont(spawn->pid, spawn->timeout_signal);
 
         log_device_error(spawn->device, "Spawned process '%s' ["PID_FMT"] timed out after %s, killing",
                          spawn->cmd, spawn->pid,
@@ -717,6 +721,7 @@ static int spawn_wait(Spawn *spawn) {
 
 int udev_event_spawn(UdevEvent *event,
                      usec_t timeout_usec,
+                     int timeout_signal,
                      bool accept_failure,
                      const char *cmd,
                      char *result, size_t ressize) {
@@ -793,6 +798,7 @@ int udev_event_spawn(UdevEvent *event,
                 .accept_failure = accept_failure,
                 .timeout_warn_usec = udev_warn_timeout(timeout_usec),
                 .timeout_usec = timeout_usec,
+                .timeout_signal = timeout_signal,
                 .event_birth_usec = event->birth_usec,
                 .fd_stdout = outpipe[READ_END],
                 .fd_stderr = errpipe[READ_END],
@@ -834,11 +840,6 @@ static int rename_netif(UdevEvent *event) {
         if (r < 0)
                 return log_device_error_errno(dev, r, "Failed to get ifindex: %m");
 
-        r = rtnl_set_link_name(&event->rtnl, ifindex, event->name);
-        if (r < 0)
-                return log_device_error_errno(dev, r, "Failed to rename network interface %i from '%s' to '%s': %m",
-                                              ifindex, oldname, event->name);
-
         /* Set ID_RENAMING boolean property here, and drop it in the corresponding move uevent later. */
         r = device_add_property(dev, "ID_RENAMING", "1");
         if (r < 0)
@@ -847,6 +848,22 @@ static int rename_netif(UdevEvent *event) {
         r = device_rename(dev, event->name);
         if (r < 0)
                 return log_device_warning_errno(dev, r, "Failed to update properties with new name '%s': %m", event->name);
+
+        /* Also set ID_RENAMING boolean property to cloned sd_device object and save it to database
+         * before calling rtnl_set_link_name(). Otherwise, clients (e.g., systemd-networkd) may receive
+         * RTM_NEWLINK netlink message before the database is updated. */
+        r = device_add_property(event->dev_db_clone, "ID_RENAMING", "1");
+        if (r < 0)
+                return log_device_warning_errno(event->dev_db_clone, r, "Failed to add 'ID_RENAMING' property: %m");
+
+        r = device_update_db(event->dev_db_clone);
+        if (r < 0)
+                return log_device_debug_errno(event->dev_db_clone, r, "Failed to update database under /run/udev/data/: %m");
+
+        r = rtnl_set_link_name(&event->rtnl, ifindex, event->name);
+        if (r < 0)
+                return log_device_error_errno(dev, r, "Failed to rename network interface %i from '%s' to '%s': %m",
+                                              ifindex, oldname, event->name);
 
         log_device_debug(dev, "Network interface %i is renamed from '%s' to '%s'", ifindex, oldname, event->name);
 
@@ -864,8 +881,7 @@ static int update_devnode(UdevEvent *event) {
                 return log_device_error_errno(dev, r, "Failed to get devnum: %m");
 
         /* remove/update possible left-over symlinks from old database entry */
-        if (event->dev_db_clone)
-                (void) udev_node_update_old_links(dev, event->dev_db_clone);
+        (void) udev_node_update_old_links(dev, event->dev_db_clone);
 
         if (!uid_is_valid(event->uid)) {
                 r = device_get_devnode_uid(dev, &event->uid);
@@ -896,6 +912,7 @@ static int update_devnode(UdevEvent *event) {
 static void event_execute_rules_on_remove(
                 UdevEvent *event,
                 usec_t timeout_usec,
+                int timeout_signal,
                 Hashmap *properties_list,
                 UdevRules *rules) {
 
@@ -917,7 +934,7 @@ static void event_execute_rules_on_remove(
         if (sd_device_get_devnum(dev, NULL) >= 0)
                 (void) udev_watch_end(dev);
 
-        (void) udev_rules_apply_to_event(rules, event, timeout_usec, properties_list);
+        (void) udev_rules_apply_to_event(rules, event, timeout_usec, timeout_signal, properties_list);
 
         if (sd_device_get_devnum(dev, NULL) >= 0)
                 (void) udev_node_remove(dev);
@@ -927,8 +944,7 @@ static int udev_event_on_move(UdevEvent *event) {
         sd_device *dev = event->dev;
         int r;
 
-        if (event->dev_db_clone &&
-            sd_device_get_devnum(dev, NULL) < 0) {
+        if (sd_device_get_devnum(dev, NULL) < 0) {
                 r = device_copy_properties(dev, event->dev_db_clone);
                 if (r < 0)
                         log_device_debug_errno(dev, r, "Failed to copy properties from cloned sd_device object, ignoring: %m");
@@ -944,6 +960,7 @@ static int udev_event_on_move(UdevEvent *event) {
 
 int udev_event_execute_rules(UdevEvent *event,
                              usec_t timeout_usec,
+                             int timeout_signal,
                              Hashmap *properties_list,
                              UdevRules *rules) {
         const char *subsystem;
@@ -965,7 +982,7 @@ int udev_event_execute_rules(UdevEvent *event,
                 return log_device_error_errno(dev, r, "Failed to get ACTION: %m");
 
         if (action == DEVICE_ACTION_REMOVE) {
-                event_execute_rules_on_remove(event, timeout_usec, properties_list, rules);
+                event_execute_rules_on_remove(event, timeout_usec, timeout_signal, properties_list, rules);
                 return 0;
         }
 
@@ -973,7 +990,7 @@ int udev_event_execute_rules(UdevEvent *event,
         if (r < 0)
                 return log_device_debug_errno(dev, r, "Failed to clone sd_device object: %m");
 
-        if (event->dev_db_clone && sd_device_get_devnum(dev, NULL) >= 0)
+        if (sd_device_get_devnum(dev, NULL) >= 0)
                 /* Disable watch during event processing. */
                 (void) udev_watch_end(event->dev_db_clone);
 
@@ -983,7 +1000,7 @@ int udev_event_execute_rules(UdevEvent *event,
                         return r;
         }
 
-        r = udev_rules_apply_to_event(rules, event, timeout_usec, properties_list);
+        r = udev_rules_apply_to_event(rules, event, timeout_usec, timeout_signal, properties_list);
         if (r < 0)
                 return log_device_debug_errno(dev, r, "Failed to apply udev rules: %m");
 
@@ -1011,12 +1028,10 @@ int udev_event_execute_rules(UdevEvent *event,
 
         device_set_is_initialized(dev);
 
-        event->dev_db_clone = sd_device_unref(event->dev_db_clone);
-
         return 0;
 }
 
-void udev_event_execute_run(UdevEvent *event, usec_t timeout_usec) {
+void udev_event_execute_run(UdevEvent *event, usec_t timeout_usec, int timeout_signal) {
         const char *command;
         void *val;
         Iterator i;
@@ -1040,7 +1055,8 @@ void udev_event_execute_run(UdevEvent *event, usec_t timeout_usec) {
                         }
 
                         log_device_debug(event->dev, "Running command \"%s\"", command);
-                        r = udev_event_spawn(event, timeout_usec, false, command, NULL, 0);
+
+                        r = udev_event_spawn(event, timeout_usec, timeout_signal, false, command, NULL, 0);
                         if (r < 0)
                                 log_device_warning_errno(event->dev, r, "Failed to execute '%s', ignoring: %m", command);
                         else if (r > 0) /* returned value is positive when program fails */

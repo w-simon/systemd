@@ -46,6 +46,15 @@
       <citerefentry><refentrytitle>systemd.nspawn</refentrytitle><manvolnum>5</manvolnum></citerefentry>
       </para></listitem>
 
+      <listitem><para>link files, see
+      <citerefentry><refentrytitle>systemd.link</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+      </para></listitem>
+
+      <listitem><para>netdev and network files, see
+      <citerefentry><refentrytitle>systemd.netdev</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
+      <citerefentry><refentrytitle>systemd.network</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+      </para></listitem>
+
       <listitem><para>daemon config files, see
       <citerefentry><refentrytitle>systemd-system.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>systemd-user.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
@@ -89,10 +98,10 @@ KeyTwo=value 2 \
        value 2 continued
 
 [Section C]
-KeyThree=value 2\
+KeyThree=value 3\
 # this line is ignored
 ; this line is ignored too
-       value 2 continued
+       value 3 continued
 </programlisting></example>
 
     <para>Boolean arguments used in configuration files can be written in

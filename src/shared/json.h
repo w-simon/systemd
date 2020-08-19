@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "sd-id128.h"
+
 #include "macro.h"
 #include "string-util.h"
 #include "log.h"
@@ -65,6 +67,7 @@ int json_variant_new_array_bytes(JsonVariant **ret, const void *p, size_t n);
 int json_variant_new_array_strv(JsonVariant **ret, char **l);
 int json_variant_new_object(JsonVariant **ret, JsonVariant **array, size_t n);
 int json_variant_new_null(JsonVariant **ret);
+int json_variant_new_id128(JsonVariant **ret, sd_id128_t id);
 
 static inline int json_variant_new_string(JsonVariant **ret, const char *s) {
         return json_variant_new_stringn(ret, s, (size_t) -1);
@@ -135,6 +138,7 @@ JsonVariant *json_variant_by_key_full(JsonVariant *v, const char *key, JsonVaria
 bool json_variant_equal(JsonVariant *a, JsonVariant *b);
 
 void json_variant_sensitive(JsonVariant *v);
+bool json_variant_is_sensitive(JsonVariant *v);
 
 struct json_variant_foreach_state {
         JsonVariant *variant;
@@ -182,6 +186,7 @@ int json_variant_set_field_string(JsonVariant **v, const char *field, const char
 int json_variant_set_field_integer(JsonVariant **v, const char *field, intmax_t value);
 int json_variant_set_field_unsigned(JsonVariant **v, const char *field, uintmax_t value);
 int json_variant_set_field_boolean(JsonVariant **v, const char *field, bool b);
+int json_variant_set_field_strv(JsonVariant **v, const char *field, char **l);
 
 int json_variant_append_array(JsonVariant **v, JsonVariant *element);
 
@@ -222,6 +227,7 @@ enum {
         _JSON_BUILD_LITERAL,
         _JSON_BUILD_STRV,
         _JSON_BUILD_BASE64,
+        _JSON_BUILD_ID128,
         _JSON_BUILD_MAX,
 };
 
@@ -242,6 +248,7 @@ enum {
 #define JSON_BUILD_LITERAL(l) _JSON_BUILD_LITERAL, ({ const char *_x = l; _x; })
 #define JSON_BUILD_STRV(l) _JSON_BUILD_STRV, ({ char **_x = l; _x; })
 #define JSON_BUILD_BASE64(p, n) _JSON_BUILD_BASE64, ({ const void *_x = p; _x; }), ({ size_t _y = n; _y; })
+#define JSON_BUILD_ID128(id) _JSON_BUILD_ID128, ({ sd_id128_t _x = id; _x; })
 
 int json_build(JsonVariant **ret, ...);
 int json_buildv(JsonVariant **ret, va_list ap);
@@ -255,6 +262,7 @@ typedef enum JsonDispatchFlags {
         JSON_MANDATORY  = 1 << 1, /* Should existence of this property be mandatory? */
         JSON_LOG        = 1 << 2, /* Should the parser log about errors? */
         JSON_SAFE       = 1 << 3, /* Don't accept "unsafe" strings in json_dispatch_string() + json_dispatch_string() */
+        JSON_RELAX      = 1 << 4, /* Use relaxed user name checking in json_dispatch_user_group_name */
 
         /* The following two may be passed into log_json() in addition to the three above */
         JSON_DEBUG      = 1 << 4, /* Indicates that this log message is a debug message */

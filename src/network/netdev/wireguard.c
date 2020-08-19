@@ -219,6 +219,7 @@ static int wireguard_set_interface(NetDev *netdev) {
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
         WireguardIPmask *mask_start = NULL;
         WireguardPeer *peer, *peer_start;
+        bool sent_once = false;
         uint32_t serial;
         Wireguard *w;
         int r;
@@ -227,7 +228,7 @@ static int wireguard_set_interface(NetDev *netdev) {
         w = WIREGUARD(netdev);
         assert(w);
 
-        for (peer_start = w->peers; peer_start; ) {
+        for (peer_start = w->peers; peer_start || !sent_once; ) {
                 uint16_t i = 0;
 
                 message = sd_netlink_message_unref(message);
@@ -278,6 +279,8 @@ static int wireguard_set_interface(NetDev *netdev) {
                 r = sd_netlink_send(netdev->manager->genl, message, &serial);
                 if (r < 0)
                         return log_netdev_error_errno(netdev, r, "Could not set wireguard device: %m");
+
+                sent_once = true;
         }
 
         return 0;
@@ -345,14 +348,7 @@ static int wireguard_resolve_handler(sd_resolve_query *q,
         if (ret != 0) {
                 log_netdev_error(netdev, "Failed to resolve host '%s:%s': %s", peer->endpoint_host, peer->endpoint_port, gai_strerror(ret));
 
-                r = set_ensure_allocated(&w->peers_with_failed_endpoint, NULL);
-                if (r < 0) {
-                        log_oom();
-                        peer->section->invalid = true;
-                        goto resolve_next;
-                }
-
-                r = set_put(w->peers_with_failed_endpoint, peer);
+                r = set_ensure_put(&w->peers_with_failed_endpoint, NULL, peer);
                 if (r < 0) {
                         log_netdev_error(netdev, "Failed to save a peer, dropping the peer: %m");
                         peer->section->invalid = true;
@@ -463,7 +459,7 @@ int config_parse_wireguard_listen_port(
 
         r = parse_ip_port(rvalue, s);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r,
+                log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Invalid port specification, ignoring assignment: %s", rvalue);
                 return 0;
         }
@@ -498,10 +494,10 @@ static int wireguard_decode_key_and_warn(
 
         r = unbase64mem_full(rvalue, strlen(rvalue), true, &key, &len);
         if (r < 0)
-                return log_syntax(unit, LOG_ERR, filename, line, r,
+                return log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to decode wireguard key provided by %s=, ignoring assignment: %m", lvalue);
         if (len != WG_KEY_LEN)
-                return log_syntax(unit, LOG_ERR, filename, line, 0,
+                return log_syntax(unit, LOG_WARNING, filename, line, SYNTHETIC_ERRNO(EINVAL),
                            "Wireguard key provided by %s= has invalid length (%zu bytes), ignoring assignment.",
                            lvalue, len);
 
@@ -577,7 +573,7 @@ int config_parse_wireguard_preshared_key(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(wireguard_peer_free_or_set_invalidp) WireguardPeer *peer = NULL;
+        WireguardPeer *peer;
         Wireguard *w;
         int r;
 
@@ -587,13 +583,9 @@ int config_parse_wireguard_preshared_key(
 
         r = wireguard_peer_new_static(w, filename, section_line, &peer);
         if (r < 0)
-                return r;
+                return log_oom();
 
-        r = wireguard_decode_key_and_warn(rvalue, peer->preshared_key, unit, filename, line, lvalue);
-        if (r < 0)
-                return r;
-
-        TAKE_PTR(peer);
+        (void) wireguard_decode_key_and_warn(rvalue, peer->preshared_key, unit, filename, line, lvalue);
         return 0;
 }
 
@@ -620,7 +612,7 @@ int config_parse_wireguard_preshared_key_file(
 
         r = wireguard_peer_new_static(w, filename, section_line, &peer);
         if (r < 0)
-                return r;
+                return log_oom();
 
         if (isempty(rvalue)) {
                 peer->preshared_key_file = mfree(peer->preshared_key_file);
@@ -662,11 +654,11 @@ int config_parse_wireguard_public_key(
 
         r = wireguard_peer_new_static(w, filename, section_line, &peer);
         if (r < 0)
-                return r;
+                return log_oom();
 
         r = wireguard_decode_key_and_warn(rvalue, peer->public_key, unit, filename, line, lvalue);
         if (r < 0)
-                return r;
+                return 0;
 
         TAKE_PTR(peer);
         return 0;
@@ -699,25 +691,25 @@ int config_parse_wireguard_allowed_ips(
 
         r = wireguard_peer_new_static(w, filename, section_line, &peer);
         if (r < 0)
-                return r;
+                return log_oom();
 
-        for (;;) {
+        for (const char *p = rvalue;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&rvalue, &word, "," WHITESPACE, 0);
+                r = extract_first_word(&p, &word, "," WHITESPACE, 0);
                 if (r == 0)
                         break;
                 if (r == -ENOMEM)
                         return log_oom();
                 if (r < 0) {
-                        log_syntax(unit, LOG_ERR, filename, line, r,
+                        log_syntax(unit, LOG_WARNING, filename, line, r,
                                    "Failed to split allowed ips \"%s\" option: %m", rvalue);
                         break;
                 }
 
                 r = in_addr_prefix_from_string_auto(word, &family, &addr, &prefixlen);
                 if (r < 0) {
-                        log_syntax(unit, LOG_ERR, filename, line, r,
+                        log_syntax(unit, LOG_WARNING, filename, line, r,
                                    "Network address is invalid, ignoring assignment: %s", word);
                         continue;
                 }
@@ -763,15 +755,11 @@ int config_parse_wireguard_endpoint(
         w = WIREGUARD(data);
         assert(w);
 
-        r = wireguard_peer_new_static(w, filename, section_line, &peer);
-        if (r < 0)
-                return r;
-
         if (rvalue[0] == '[') {
                 begin = &rvalue[1];
                 end = strchr(rvalue, ']');
                 if (!end) {
-                        log_syntax(unit, LOG_ERR, filename, line, 0,
+                        log_syntax(unit, LOG_WARNING, filename, line, 0,
                                    "Unable to find matching brace of endpoint, ignoring assignment: %s",
                                    rvalue);
                         return 0;
@@ -779,7 +767,7 @@ int config_parse_wireguard_endpoint(
                 len = end - begin;
                 ++end;
                 if (*end != ':' || !*(end + 1)) {
-                        log_syntax(unit, LOG_ERR, filename, line, 0,
+                        log_syntax(unit, LOG_WARNING, filename, line, 0,
                                    "Unable to find port of endpoint, ignoring assignment: %s",
                                    rvalue);
                         return 0;
@@ -789,7 +777,7 @@ int config_parse_wireguard_endpoint(
                 begin = rvalue;
                 end = strrchr(rvalue, ':');
                 if (!end || !*(end + 1)) {
-                        log_syntax(unit, LOG_ERR, filename, line, 0,
+                        log_syntax(unit, LOG_WARNING, filename, line, 0,
                                    "Unable to find port of endpoint, ignoring assignment: %s",
                                    rvalue);
                         return 0;
@@ -797,6 +785,10 @@ int config_parse_wireguard_endpoint(
                 len = end - begin;
                 ++end;
         }
+
+        r = wireguard_peer_new_static(w, filename, section_line, &peer);
+        if (r < 0)
+                return log_oom();
 
         r = free_and_strndup(&peer->endpoint_host, begin, len);
         if (r < 0)
@@ -806,15 +798,11 @@ int config_parse_wireguard_endpoint(
         if (r < 0)
                 return log_oom();
 
-        r = set_ensure_allocated(&w->peers_with_unresolved_endpoint, NULL);
+        r = set_ensure_put(&w->peers_with_unresolved_endpoint, NULL, peer);
         if (r < 0)
                 return log_oom();
+        TAKE_PTR(peer); /* The peer may already have been in the hash map, that is fine too. */
 
-        r = set_put(w->peers_with_unresolved_endpoint, peer);
-        if (r < 0)
-                return r;
-
-        TAKE_PTR(peer);
         return 0;
 }
 
@@ -830,7 +818,7 @@ int config_parse_wireguard_keepalive(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(wireguard_peer_free_or_set_invalidp) WireguardPeer *peer = NULL;
+        WireguardPeer *peer;
         uint16_t keepalive = 0;
         Wireguard *w;
         int r;
@@ -843,23 +831,21 @@ int config_parse_wireguard_keepalive(
 
         r = wireguard_peer_new_static(w, filename, section_line, &peer);
         if (r < 0)
-                return r;
+                return log_oom();
 
         if (streq(rvalue, "off"))
                 keepalive = 0;
         else {
                 r = safe_atou16(rvalue, &keepalive);
                 if (r < 0) {
-                        log_syntax(unit, LOG_ERR, filename, line, r,
-                                   "The persistent keepalive interval must be 0-65535. Ignore assignment: %s",
+                        log_syntax(unit, LOG_WARNING, filename, line, r,
+                                   "Failed to parse \"%s\" as keepalive interval (range 0–65535), ignoring assignment: %m",
                                    rvalue);
                         return 0;
                 }
         }
 
         peer->persistent_keepalive_interval = keepalive;
-
-        TAKE_PTR(peer);
         return 0;
 }
 
@@ -902,7 +888,10 @@ static int wireguard_read_key_file(const char *filename, uint8_t dest[static WG_
 
         (void) warn_file_is_world_accessible(filename, NULL, NULL, 0);
 
-        r = read_full_file_full(AT_FDCWD, filename, READ_FULL_FILE_SECURE | READ_FULL_FILE_UNBASE64, &key, &key_len);
+        r = read_full_file_full(
+                        AT_FDCWD, filename,
+                        READ_FULL_FILE_SECURE | READ_FULL_FILE_UNBASE64 | READ_FULL_FILE_WARN_WORLD_READABLE | READ_FULL_FILE_CONNECT_SOCKET,
+                        &key, &key_len);
         if (r < 0)
                 return r;
 

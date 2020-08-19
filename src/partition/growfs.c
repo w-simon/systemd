@@ -56,7 +56,7 @@ static int resize_crypt_luks_device(dev_t devno, const char *fstype, dev_t main_
         if (r < 0)
                 return log_error_errno(r, "crypt_init(\"%s\") failed: %m", devpath);
 
-        crypt_set_log_callback(cd, cryptsetup_log_glue, NULL);
+        cryptsetup_enable_logging(cd);
 
         r = crypt_load(cd, CRYPT_LUKS, NULL);
         if (r < 0)
@@ -79,15 +79,13 @@ static int resize_crypt_luks_device(dev_t devno, const char *fstype, dev_t main_
 }
 #endif
 
-static int maybe_resize_slave_device(const char *mountpath, dev_t main_devno) {
+static int maybe_resize_underlying_device(const char *mountpath, dev_t main_devno) {
         _cleanup_free_ char *fstype = NULL, *devpath = NULL;
         dev_t devno;
         int r;
 
 #if HAVE_LIBCRYPTSETUP
-        crypt_set_log_callback(NULL, cryptsetup_log_glue, NULL);
-        if (DEBUG_LOGGING)
-                crypt_set_debug_level(CRYPT_DEBUG_ALL);
+        cryptsetup_enable_logging(NULL);
 #endif
 
         r = get_block_device_harder(mountpath, &devno);
@@ -213,7 +211,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to determine block device of \"%s\": %m", arg_target);
 
-        r = maybe_resize_slave_device(arg_target, devno);
+        r = maybe_resize_underlying_device(arg_target, devno);
         if (r < 0)
                 return r;
 

@@ -26,10 +26,12 @@ struct Manager {
         sd_bus *bus;
         sd_device_monitor *device_monitor;
         Hashmap *polkit_registry;
+        int ethtool_fd;
 
         bool enumerating:1;
         bool dirty:1;
         bool restarting:1;
+        bool manage_foreign_routes;
 
         Set *dirty_links;
 
@@ -42,6 +44,7 @@ struct Manager {
         Hashmap *netdevs;
         OrderedHashmap *networks;
         Hashmap *dhcp6_prefixes;
+        Set *dhcp6_pd_prefixes;
         LIST_HEAD(AddressPool, address_pools);
 
         usec_t network_dirs_ts_usec;

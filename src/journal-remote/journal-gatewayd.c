@@ -123,17 +123,15 @@ static int request_meta_ensure_tmp(RequestMeta *m) {
         if (m->tmp)
                 rewind(m->tmp);
         else {
-                int fd;
+                _cleanup_close_ int fd = -1;
 
                 fd = open_tmpfile_unlinkable("/tmp", O_RDWR|O_CLOEXEC);
                 if (fd < 0)
                         return fd;
 
-                m->tmp = fdopen(fd, "w+");
-                if (!m->tmp) {
-                        safe_close(fd);
+                m->tmp = take_fdopen(&fd, "w+");
+                if (!m->tmp)
                         return -errno;
-                }
         }
 
         return 0;
@@ -351,7 +349,7 @@ static int request_parse_range(
         return 0;
 }
 
-static int request_parse_arguments_iterator(
+static mhd_result request_parse_arguments_iterator(
                 void *cls,
                 enum MHD_ValueKind kind,
                 const char *key,
@@ -798,7 +796,7 @@ static int request_handler_machine(
         return MHD_queue_response(connection, MHD_HTTP_OK, response);
 }
 
-static int request_handler(
+static mhd_result request_handler(
                 void *cls,
                 struct MHD_Connection *connection,
                 const char *url,
@@ -908,7 +906,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (arg_key_pem)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Key file specified twice");
-                        r = read_full_file(optarg, &arg_key_pem, NULL);
+                        r = read_full_file_full(AT_FDCWD, optarg, READ_FULL_FILE_CONNECT_SOCKET, &arg_key_pem, NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to read key file: %m");
                         assert(arg_key_pem);
@@ -918,7 +916,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (arg_cert_pem)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Certificate file specified twice");
-                        r = read_full_file(optarg, &arg_cert_pem, NULL);
+                        r = read_full_file_full(AT_FDCWD, optarg, READ_FULL_FILE_CONNECT_SOCKET, &arg_cert_pem, NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to read certificate file: %m");
                         assert(arg_cert_pem);
@@ -929,7 +927,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (arg_trust_pem)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "CA certificate file specified twice");
-                        r = read_full_file(optarg, &arg_trust_pem, NULL);
+                        r = read_full_file_full(AT_FDCWD, optarg, READ_FULL_FILE_CONNECT_SOCKET, &arg_trust_pem, NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to read CA certificate file: %m");
                         assert(arg_trust_pem);

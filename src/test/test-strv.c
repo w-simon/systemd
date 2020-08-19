@@ -9,12 +9,17 @@
 
 static void test_specifier_printf(void) {
         static const Specifier table[] = {
-                { 'a', specifier_string, (char*) "AAAA" },
-                { 'b', specifier_string, (char*) "BBBB" },
-                { 'm', specifier_machine_id, NULL },
-                { 'B', specifier_boot_id, NULL },
-                { 'H', specifier_host_name, NULL },
+                { 'X', specifier_string,         (char*) "AAAA" },
+                { 'Y', specifier_string,         (char*) "BBBB" },
+                { 'm', specifier_machine_id,     NULL },
+                { 'b', specifier_boot_id,        NULL },
+                { 'H', specifier_host_name,      NULL },
                 { 'v', specifier_kernel_release, NULL },
+                { 'a', specifier_architecture,   NULL },
+                { 'o', specifier_os_id,          NULL },
+                { 'w', specifier_os_version_id,  NULL },
+                { 'B', specifier_os_build_id,    NULL },
+                { 'W', specifier_os_variant_id,  NULL },
                 {}
         };
 
@@ -23,7 +28,7 @@ static void test_specifier_printf(void) {
 
         log_info("/* %s */", __func__);
 
-        r = specifier_printf("xxx a=%a b=%b yyy", table, NULL, &w);
+        r = specifier_printf("xxx a=%X b=%Y yyy", table, NULL, &w);
         assert_se(r >= 0);
         assert_se(w);
 
@@ -31,10 +36,15 @@ static void test_specifier_printf(void) {
         assert_se(streq(w, "xxx a=AAAA b=BBBB yyy"));
 
         free(w);
-        r = specifier_printf("machine=%m, boot=%B, host=%H, version=%v", table, NULL, &w);
+        r = specifier_printf("machine=%m, boot=%b, host=%H, version=%v, arch=%a", table, NULL, &w);
         assert_se(r >= 0);
         assert_se(w);
         puts(w);
+
+        w = mfree(w);
+        specifier_printf("os=%o, os-version=%w, build=%B, variant=%W", table, NULL, &w);
+        if (w)
+                puts(w);
 }
 
 static void test_str_in_set(void) {
@@ -307,6 +317,12 @@ static void test_strv_split(void) {
         l = strv_split_full("    'one'  \"  two\t three \"' four  five", NULL, SPLIT_QUOTES | SPLIT_RELAX);
         assert_se(l);
         assert_se(strv_equal(l, (char**) input_table_quoted));
+
+        strv_free_erase(l);
+
+        l = strv_split_full("\\", NULL, SPLIT_QUOTES | SPLIT_RELAX);
+        assert_se(l);
+        assert_se(strv_equal(l, STRV_MAKE("\\")));
 }
 
 static void test_strv_split_empty(void) {
@@ -391,6 +407,35 @@ static void test_strv_split_extract(void) {
         assert_se(streq_ptr(l[5], NULL));
 }
 
+static void test_strv_split_colon_pairs(void) {
+        _cleanup_strv_free_ char **l = NULL;
+        const char *str = "one:two three four:five six seven:eight\\:nine ten\\:eleven\\\\",
+                   *str_inval="one:two three:four:five";
+        int r;
+
+        log_info("/* %s */", __func__);
+
+        r = strv_split_colon_pairs(&l, str);
+        assert_se(r == (int) strv_length(l));
+        assert_se(r == 12);
+        assert_se(streq_ptr(l[0], "one"));
+        assert_se(streq_ptr(l[1], "two"));
+        assert_se(streq_ptr(l[2], "three"));
+        assert_se(streq_ptr(l[3], ""));
+        assert_se(streq_ptr(l[4], "four"));
+        assert_se(streq_ptr(l[5], "five"));
+        assert_se(streq_ptr(l[6], "six"));
+        assert_se(streq_ptr(l[7], ""));
+        assert_se(streq_ptr(l[8], "seven"));
+        assert_se(streq_ptr(l[9], "eight:nine"));
+        assert_se(streq_ptr(l[10], "ten:eleven\\"));
+        assert_se(streq_ptr(l[11], ""));
+        assert_se(streq_ptr(l[12], NULL));
+
+        r = strv_split_colon_pairs(&l, str_inval);
+        assert_se(r == -EINVAL);
+}
+
 static void test_strv_split_newlines(void) {
         unsigned i = 0;
         char **s;
@@ -402,9 +447,8 @@ static void test_strv_split_newlines(void) {
         l = strv_split_newlines(str);
         assert_se(l);
 
-        STRV_FOREACH(s, l) {
+        STRV_FOREACH(s, l)
                 assert_se(streq(*s, input_table_multiple[i++]));
-        }
 }
 
 static void test_strv_split_nulstr(void) {
@@ -674,7 +718,7 @@ static void test_strv_push_prepend(void) {
 
         log_info("/* %s */", __func__);
 
-        a = strv_new("foo", "bar", "three");
+        assert_se(a = strv_new("foo", "bar", "three"));
 
         assert_se(strv_push_prepend(&a, strdup("first")) >= 0);
         assert_se(streq(a[0], "first"));
@@ -983,6 +1027,7 @@ int main(int argc, char *argv[]) {
         test_strv_split();
         test_strv_split_empty();
         test_strv_split_extract();
+        test_strv_split_colon_pairs();
         test_strv_split_newlines();
         test_strv_split_nulstr();
         test_strv_parse_nulstr();

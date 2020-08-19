@@ -6,6 +6,7 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "hashmap.h"
+#include "io-util.h"
 #include "list.h"
 #include "process-util.h"
 #include "set.h"
@@ -271,6 +272,7 @@ static int varlink_new(Varlink **ret) {
 int varlink_connect_address(Varlink **ret, const char *address) {
         _cleanup_(varlink_unrefp) Varlink *v = NULL;
         union sockaddr_union sockaddr;
+        socklen_t sockaddr_len;
         int r;
 
         assert_return(ret, -EINVAL);
@@ -279,6 +281,7 @@ int varlink_connect_address(Varlink **ret, const char *address) {
         r = sockaddr_un_set_path(&sockaddr.un, address);
         if (r < 0)
                 return r;
+        sockaddr_len = r;
 
         r = varlink_new(&v);
         if (r < 0)
@@ -290,7 +293,7 @@ int varlink_connect_address(Varlink **ret, const char *address) {
 
         v->fd = fd_move_above_stdio(v->fd);
 
-        if (connect(v->fd, &sockaddr.sa, SOCKADDR_UN_LEN(sockaddr.un)) < 0) {
+        if (connect(v->fd, &sockaddr.sa, sockaddr_len) < 0) {
                 if (!IN_SET(errno, EAGAIN, EINPROGRESS))
                         return -errno;
 
@@ -384,7 +387,7 @@ DEFINE_TRIVIAL_REF_UNREF_FUNC(Varlink, varlink, varlink_destroy);
 static int varlink_test_disconnect(Varlink *v) {
         assert(v);
 
-        /* Tests whether we the the connection has been terminated. We are careful to not stop processing it
+        /* Tests whether we the connection has been terminated. We are careful to not stop processing it
          * prematurely, since we want to handle half-open connections as well as possible and want to flush
          * out and read data before we close down if we can. */
 
@@ -1001,8 +1004,6 @@ static void handle_revents(Varlink *v, int revents) {
 }
 
 int varlink_wait(Varlink *v, usec_t timeout) {
-        struct timespec ts;
-        struct pollfd pfd;
         int r, fd, events;
         usec_t t;
 
@@ -1036,20 +1037,14 @@ int varlink_wait(Varlink *v, usec_t timeout) {
         if (events < 0)
                 return events;
 
-        pfd = (struct pollfd) {
-                .fd = fd,
-                .events = events,
-        };
-
-        r = ppoll(&pfd, 1,
-                  t == USEC_INFINITY ? NULL : timespec_store(&ts, t),
-                  NULL);
+        r = fd_wait_for_event(fd, events, t);
         if (r < 0)
-                return -errno;
+                return r;
+        if (r == 0)
+                return 0;
 
-        handle_revents(v, pfd.revents);
-
-        return r > 0 ? 1 : 0;
+        handle_revents(v, r);
+        return 1;
 }
 
 int varlink_get_fd(Varlink *v) {
@@ -1117,8 +1112,6 @@ int varlink_flush(Varlink *v) {
                 return -ENOTCONN;
 
         for (;;) {
-                struct pollfd pfd;
-
                 if (v->output_buffer_size == 0)
                         break;
                 if (v->write_disconnected)
@@ -1132,15 +1125,13 @@ int varlink_flush(Varlink *v) {
                         continue;
                 }
 
-                pfd = (struct pollfd) {
-                        .fd = v->fd,
-                        .events = POLLOUT,
-                };
+                r = fd_wait_for_event(v->fd, POLLOUT, USEC_INFINITY);
+                if (r < 0)
+                        return r;
 
-                if (poll(&pfd, 1, -1) < 0)
-                        return -errno;
+                assert(r != 0);
 
-                handle_revents(v, pfd.revents);
+                handle_revents(v, r);
         }
 
         return ret;
@@ -1332,7 +1323,7 @@ int varlink_invoke(Varlink *v, const char *method, JsonVariant *parameters) {
         if (v->state == VARLINK_DISCONNECTED)
                 return -ENOTCONN;
 
-        /* We allow enqueing multiple method calls at once! */
+        /* We allow enqueuing multiple method calls at once! */
         if (!IN_SET(v->state, VARLINK_IDLE_CLIENT, VARLINK_AWAITING_REPLY))
                 return -EBUSY;
 
@@ -2224,6 +2215,7 @@ int varlink_server_listen_fd(VarlinkServer *s, int fd) {
 
 int varlink_server_listen_address(VarlinkServer *s, const char *address, mode_t m) {
         union sockaddr_union sockaddr;
+        socklen_t sockaddr_len;
         _cleanup_close_ int fd = -1;
         int r;
 
@@ -2234,6 +2226,7 @@ int varlink_server_listen_address(VarlinkServer *s, const char *address, mode_t 
         r = sockaddr_un_set_path(&sockaddr.un, address);
         if (r < 0)
                 return r;
+        sockaddr_len = r;
 
         fd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
         if (fd < 0)
@@ -2244,7 +2237,7 @@ int varlink_server_listen_address(VarlinkServer *s, const char *address, mode_t 
         (void) sockaddr_un_unlink(&sockaddr.un);
 
         RUN_WITH_UMASK(~m & 0777)
-                if (bind(fd, &sockaddr.sa, SOCKADDR_UN_LEN(sockaddr.un)) < 0)
+                if (bind(fd, &sockaddr.sa, sockaddr_len) < 0)
                         return -errno;
 
         if (listen(fd, SOMAXCONN) < 0)

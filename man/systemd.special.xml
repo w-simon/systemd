@@ -106,7 +106,7 @@
   </refsect1>
 
   <refsect1>
-    <title>Units managed by the system's service manager</title>
+    <title>Units managed by the system service manager</title>
 
     <refsect2>
       <title>Special System Units</title>
@@ -228,22 +228,25 @@
           <term><filename>emergency.target</filename></term>
           <listitem>
             <para>A special target unit that starts an emergency shell on the main console. This
-            target does not pull in any services or mounts. It is the most minimal version of
+            target does not pull in other services or mounts. It is the most minimal version of
             starting the system in order to acquire an interactive shell; the only processes running
-            are usually just the system manager (PID 1) and the shell process. This unit is supposed
-            to be used with the kernel command line option <varname>systemd.unit=</varname>; it is
-            also used when a file system check on a required file system fails, and boot-up cannot
+            are usually just the system manager (PID 1) and the shell process. This unit may be used
+            by specifying <varname>emergency</varname> on the kernel command line; it is
+            also used when a file system check on a required file system fails and boot-up cannot
             continue. Compare with <filename>rescue.target</filename>, which serves a similar
             purpose, but also starts the most basic services and mounts all file systems.</para>
-
-            <para>Use the <literal>systemd.unit=emergency.target</literal> kernel command line
-            option to boot into this mode. A short alias for this kernel command line option is
-            <literal>emergency</literal>, for compatibility with SysV.</para>
 
             <para>In many ways booting into <filename>emergency.target</filename> is similar to the
             effect of booting with <literal>init=/bin/sh</literal> on the kernel command line,
             except that emergency mode provides you with the full system and service manager, and
             allows starting individual units in order to continue the boot process in steps.</para>
+
+            <para>Note that depending on how <filename>emergency.target</filename> is reached, the root file
+            system might be mounted read-only or read-write (no remounting is done specially for this
+            target). For example, the system may boot with root mounted read-only when <varname>ro</varname>
+            is used on the kernel command line and remain this way for <filename>emergency.target</filename>,
+            or the system may transition to <filename>emergency.target</filename> after the system has been
+            partially booted and disks have already been remounted read-write.</para>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -294,7 +297,7 @@
             this unit (or <filename>multi-user.target</filename>) during
             installation. This is best configured via
             <varname>WantedBy=graphical.target</varname> in the unit's
-            <literal>[Install]</literal> section.</para>
+            [Install] section.</para>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -444,7 +447,7 @@
             add <varname>Wants=</varname> dependencies for their unit to
             this unit during installation. This is best configured via
             <varname>WantedBy=multi-user.target</varname> in the unit's
-            <literal>[Install]</literal> section.</para>
+            [Install] section.</para>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -502,7 +505,7 @@
             applications get pulled in via <varname>Wants=</varname>
             dependencies from this unit. This is best configured via a
             <varname>WantedBy=paths.target</varname> in the path unit's
-            <literal>[Install]</literal> section.</para>
+            [Install] section.</para>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -638,7 +641,7 @@
             <para>Adding slice units to <filename>slices.target</filename> is generally not
             necessary. Instead, when some unit that uses <varname>Slice=</varname> is started, the
             specified slice will be started automatically. Adding
-            <varname>WantedBy=slices.target</varname> lines to the <literal>[Install]</literal>
+            <varname>WantedBy=slices.target</varname> lines to the [Install]
             section should only be done for units that need to be always active. In that case care
             needs to be taken to avoid creating a loop through the automatic dependencies on
             "parent" slices.</para>
@@ -656,7 +659,7 @@
             <varname>Wants=</varname> dependencies to this unit for
             their socket unit during installation. This is best
             configured via a <varname>WantedBy=sockets.target</varname>
-            in the socket unit's <literal>[Install]</literal>
+            in the socket unit's [Install]
             section.</para>
           </listitem>
         </varlistentry>
@@ -739,7 +742,7 @@
             applications get pulled in via <varname>Wants=</varname>
             dependencies from this unit. This is best configured via
             <varname>WantedBy=timers.target</varname> in the timer
-            unit's <literal>[Install]</literal> section.</para>
+            unit's [Install] section.</para>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -1040,7 +1043,7 @@
             <para>By default, all user processes and services started on
             behalf of the user, including the per-user systemd instance
             are found in this slice.  This is pulled in by
-            <filename>systemd-logind.service</filename></para>
+            <filename>systemd-logind.service</filename>.</para>
           </listitem>
         </varlistentry>
 
@@ -1049,8 +1052,8 @@
           <listitem>
             <para>By default, all virtual machines and containers
             registered with <command>systemd-machined</command> are
-            found in this slice.  This is pulled in by
-            <filename>systemd-machined.service</filename></para>
+            found in this slice. This is pulled in by
+            <filename>systemd-machined.service</filename>.</para>
           </listitem>
         </varlistentry>
       </variablelist>
@@ -1058,7 +1061,7 @@
   </refsect1>
 
   <refsect1>
-    <title>Units managed by the user's service manager</title>
+    <title>Units managed by the user service manager</title>
 
     <refsect2>
       <title>Special User Units</title>
@@ -1101,7 +1104,7 @@
             <para>This target is active whenever any graphical session is running. It is used to
             stop user services which only apply to a graphical (X, Wayland, etc.) session when the
             session is terminated. Such services should have
-            <literal>PartOf=graphical-session.target</literal> in their <literal>[Unit]</literal>
+            <literal>PartOf=graphical-session.target</literal> in their [Unit]
             section. A target for a particular session (e. g.
             <filename>gnome-session.target</filename>) starts and stops
             <literal>graphical-session.target</literal> with
@@ -1148,6 +1151,18 @@
             upgrade (which needs to happen before starting any process that might use them). This
             target must be started before starting a graphical session like
             <filename>gnome-session.target</filename>.</para>
+          </listitem>
+        </varlistentry>
+
+        <varlistentry>
+          <term><filename>xdg-desktop-autostart.target</filename></term>
+          <listitem>
+            <para>The XDG specification defines a way to autostart applications using XDG desktop files.
+            systemd ships
+            <citerefentry><refentrytitle>systemd-xdg-autostart-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+            for the XDG desktop files in autostart directories.
+            Desktop Environments can opt-in to use this service by adding a <varname>Wants=</varname>
+            dependency on <literal>xdg-desktop-autostart.target</literal></para>.
           </listitem>
         </varlistentry>
       </variablelist>

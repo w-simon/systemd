@@ -4,10 +4,11 @@
 ***/
 
 #include <errno.h>
+#include <net/if.h>
+#include <net/if_arp.h>
 #include <stdio.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <net/if.h>
 
 #include "sd-dhcp-client.h"
 #include "sd-event.h"
@@ -257,7 +258,7 @@ int dhcp_network_send_raw_socket(int s, const union sockaddr_union *link, const 
 }
 
 int dhcp_network_bind_raw_socket(
-                int index,
+                int ifindex,
                 union sockaddr_union *link,
                 uint32_t id,
                 const uint8_t *addr, size_t addr_len,
@@ -513,7 +514,6 @@ static int test_addr_acq_recv_discover(size_t size, DHCPMessage *discover) {
 }
 
 static void test_addr_acq(sd_event *e) {
-        usec_t time_now = now(clock_boottime_or_monotonic());
         sd_dhcp_client *client;
         int res, r;
 
@@ -534,10 +534,11 @@ static void test_addr_acq(sd_event *e) {
 
         callback_recv = test_addr_acq_recv_discover;
 
-        assert_se(sd_event_add_time(e, &test_hangcheck,
-                                    clock_boottime_or_monotonic(),
-                                    time_now + 2 * USEC_PER_SEC, 0,
-                                    test_dhcp_hangcheck, NULL) >= 0);
+        assert_se(sd_event_add_time_relative(
+                                  e, &test_hangcheck,
+                                  clock_boottime_or_monotonic(),
+                                  2 * USEC_PER_SEC, 0,
+                                  test_dhcp_hangcheck, NULL) >= 0);
 
         res = sd_dhcp_client_start(client);
         assert_se(IN_SET(res, 0, -EINPROGRESS));

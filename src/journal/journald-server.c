@@ -1268,21 +1268,14 @@ int server_process_datagram(
         int *fds = NULL, v = 0;
         size_t n_fds = 0;
 
-        union {
-                struct cmsghdr cmsghdr;
-
-                /* We use NAME_MAX space for the SELinux label
-                 * here. The kernel currently enforces no
-                 * limit, but according to suggestions from
-                 * the SELinux people this will change and it
-                 * will probably be identical to NAME_MAX. For
-                 * now we use that, but this should be updated
-                 * one day when the final limit is known. */
-                uint8_t buf[CMSG_SPACE(sizeof(struct ucred)) +
-                            CMSG_SPACE(sizeof(struct timeval)) +
-                            CMSG_SPACE(sizeof(int)) + /* fd */
-                            CMSG_SPACE(NAME_MAX)]; /* selinux label */
-        } control = {};
+        /* We use NAME_MAX space for the SELinux label here. The kernel currently enforces no limit, but
+         * according to suggestions from the SELinux people this will change and it will probably be
+         * identical to NAME_MAX. For now we use that, but this should be updated one day when the final
+         * limit is known. */
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct ucred)) +
+                         CMSG_SPACE(sizeof(struct timeval)) +
+                         CMSG_SPACE(sizeof(int)) + /* fd */
+                         CMSG_SPACE(NAME_MAX) /* selinux label */) control;
 
         union sockaddr_union sa = {};
 
@@ -1317,29 +1310,35 @@ int server_process_datagram(
 
         iovec = IOVEC_MAKE(s->buffer, s->buffer_size - 1); /* Leave room for trailing NUL we add later */
 
-        n = recvmsg(fd, &msghdr, MSG_DONTWAIT|MSG_CMSG_CLOEXEC);
-        if (n < 0) {
-                if (IN_SET(errno, EINTR, EAGAIN))
-                        return 0;
-
-                return log_error_errno(errno, "recvmsg() failed: %m");
+        n = recvmsg_safe(fd, &msghdr, MSG_DONTWAIT|MSG_CMSG_CLOEXEC);
+        if (IN_SET(n, -EINTR, -EAGAIN))
+                return 0;
+        if (n == -EXFULL) {
+                log_warning("Got message with truncated control data (too many fds sent?), ignoring.");
+                return 0;
         }
+        if (n < 0)
+                return log_error_errno(n, "recvmsg() failed: %m");
 
         CMSG_FOREACH(cmsg, &msghdr)
                 if (cmsg->cmsg_level == SOL_SOCKET &&
                     cmsg->cmsg_type == SCM_CREDENTIALS &&
-                    cmsg->cmsg_len == CMSG_LEN(sizeof(struct ucred)))
+                    cmsg->cmsg_len == CMSG_LEN(sizeof(struct ucred))) {
+                        assert(!ucred);
                         ucred = (struct ucred*) CMSG_DATA(cmsg);
-                else if (cmsg->cmsg_level == SOL_SOCKET &&
+                } else if (cmsg->cmsg_level == SOL_SOCKET &&
                          cmsg->cmsg_type == SCM_SECURITY) {
+                        assert(!label);
                         label = (char*) CMSG_DATA(cmsg);
                         label_len = cmsg->cmsg_len - CMSG_LEN(0);
                 } else if (cmsg->cmsg_level == SOL_SOCKET &&
                            cmsg->cmsg_type == SO_TIMESTAMP &&
-                           cmsg->cmsg_len == CMSG_LEN(sizeof(struct timeval)))
+                           cmsg->cmsg_len == CMSG_LEN(sizeof(struct timeval))) {
+                        assert(!tv);
                         tv = (struct timeval*) CMSG_DATA(cmsg);
-                else if (cmsg->cmsg_level == SOL_SOCKET &&
+                } else if (cmsg->cmsg_level == SOL_SOCKET &&
                          cmsg->cmsg_type == SCM_RIGHTS) {
+                        assert(!fds);
                         fds = (int*) CMSG_DATA(cmsg);
                         n_fds = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
                 }
@@ -1634,23 +1633,24 @@ static int server_parse_config_file(Server *s) {
                 /* If we are running in namespace mode, load the namespace specific configuration file, and nothing else */
                 namespaced = strjoina(PKGSYSCONFDIR "/journald@", s->namespace, ".conf");
 
-                r = config_parse(
-                                NULL,
-                                namespaced, NULL,
-                                "Journal\0",
-                                config_item_perf_lookup, journald_gperf_lookup,
-                                CONFIG_PARSE_WARN, s);
+                r = config_parse(NULL,
+                                 namespaced, NULL,
+                                 "Journal\0",
+                                 config_item_perf_lookup, journald_gperf_lookup,
+                                 CONFIG_PARSE_WARN, s,
+                                 NULL);
                 if (r < 0)
                         return r;
 
                 return 0;
         }
 
-        return config_parse_many_nulstr(PKGSYSCONFDIR "/journald.conf",
-                                        CONF_PATHS_NULSTR("systemd/journald.conf.d"),
-                                        "Journal\0",
-                                        config_item_perf_lookup, journald_gperf_lookup,
-                                        CONFIG_PARSE_WARN, s);
+        return config_parse_many_nulstr(
+                        PKGSYSCONFDIR "/journald.conf",
+                        CONF_PATHS_NULSTR("systemd/journald.conf.d"),
+                        "Journal\0",
+                        config_item_perf_lookup, journald_gperf_lookup,
+                        CONFIG_PARSE_WARN, s, NULL);
 }
 
 static int server_dispatch_sync(sd_event_source *es, usec_t t, void *userdata) {
@@ -1677,27 +1677,20 @@ int server_schedule_sync(Server *s, int priority) {
                 return 0;
 
         if (s->sync_interval_usec > 0) {
-                usec_t when;
-
-                r = sd_event_now(s->event, CLOCK_MONOTONIC, &when);
-                if (r < 0)
-                        return r;
-
-                when += s->sync_interval_usec;
 
                 if (!s->sync_event_source) {
-                        r = sd_event_add_time(
+                        r = sd_event_add_time_relative(
                                         s->event,
                                         &s->sync_event_source,
                                         CLOCK_MONOTONIC,
-                                        when, 0,
+                                        s->sync_interval_usec, 0,
                                         server_dispatch_sync, s);
                         if (r < 0)
                                 return r;
 
                         r = sd_event_source_set_priority(s->sync_event_source, SD_EVENT_PRIORITY_IMPORTANT);
                 } else {
-                        r = sd_event_source_set_time(s->sync_event_source, when);
+                        r = sd_event_source_set_time_relative(s->sync_event_source, s->sync_interval_usec);
                         if (r < 0)
                                 return r;
 
@@ -1746,7 +1739,7 @@ static int server_open_hostname(Server *s) {
 
         r = sd_event_source_set_priority(s->hostname_event_source, SD_EVENT_PRIORITY_IMPORTANT-10);
         if (r < 0)
-                return log_error_errno(r, "Failed to adjust priority of host name event source: %m");
+                return log_error_errno(r, "Failed to adjust priority of hostname event source: %m");
 
         return 0;
 }
@@ -1840,9 +1833,10 @@ static int dispatch_watchdog(sd_event_source *es, uint64_t usec, void *userdata)
 }
 
 static int server_connect_notify(Server *s) {
-        union sockaddr_union sa = {};
+        union sockaddr_union sa;
+        socklen_t sa_len;
         const char *e;
-        int r, salen;
+        int r;
 
         assert(s);
         assert(s->notify_fd < 0);
@@ -1865,9 +1859,10 @@ static int server_connect_notify(Server *s) {
         if (!e)
                 return 0;
 
-        salen = sockaddr_un_set_path(&sa.un, e);
-        if (salen < 0)
-                return log_error_errno(salen, "NOTIFY_SOCKET set to invalid value '%s': %m", e);
+        r = sockaddr_un_set_path(&sa.un, e);
+        if (r < 0)
+                return log_error_errno(r, "NOTIFY_SOCKET set to invalid value '%s': %m", e);
+        sa_len = r;
 
         s->notify_fd = socket(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
         if (s->notify_fd < 0)
@@ -1875,7 +1870,7 @@ static int server_connect_notify(Server *s) {
 
         (void) fd_inc_sndbuf(s->notify_fd, NOTIFY_SNDBUF_SIZE);
 
-        r = connect(s->notify_fd, &sa.sa, salen);
+        r = connect(s->notify_fd, &sa.sa, sa_len);
         if (r < 0)
                 return log_error_errno(errno, "Failed to connect to notify socket: %m");
 
@@ -1886,7 +1881,7 @@ static int server_connect_notify(Server *s) {
         if (sd_watchdog_enabled(false, &s->watchdog_usec) > 0) {
                 s->send_watchdog = true;
 
-                r = sd_event_add_time(s->event, &s->watchdog_event_source, CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + s->watchdog_usec/2, s->watchdog_usec/4, dispatch_watchdog, s);
+                r = sd_event_add_time_relative(s->event, &s->watchdog_event_source, CLOCK_MONOTONIC, s->watchdog_usec/2, s->watchdog_usec/4, dispatch_watchdog, s);
                 if (r < 0)
                         return log_error_errno(r, "Failed to add watchdog time event: %m");
         }
@@ -1948,7 +1943,7 @@ static int vl_method_synchronize(Varlink *link, JsonVariant *parameters, Varlink
         if (r < 0)
                 return log_error_errno(r, "Failed to set event source destroy callback: %m");
 
-        varlink_ref(link); /* The varlink object is now left to the destroy callack to unref */
+        varlink_ref(link); /* The varlink object is now left to the destroy callback to unref */
 
         r = sd_event_source_set_priority(event_source, SD_EVENT_PRIORITY_NORMAL+15);
         if (r < 0)
@@ -2114,7 +2109,6 @@ static int server_idle_handler(sd_event_source *source, uint64_t usec, void *use
 
 int server_start_or_stop_idle_timer(Server *s) {
         _cleanup_(sd_event_source_unrefp) sd_event_source *source = NULL;
-        usec_t when;
         int r;
 
         assert(s);
@@ -2127,11 +2121,7 @@ int server_start_or_stop_idle_timer(Server *s) {
         if (s->idle_event_source)
                 return 1;
 
-        r = sd_event_now(s->event, CLOCK_MONOTONIC, &when);
-        if (r < 0)
-                return log_error_errno(r, "Failed to determine current time: %m");
-
-        r = sd_event_add_time(s->event, &source, CLOCK_MONOTONIC, usec_add(when, IDLE_TIMEOUT_USEC), 0, server_idle_handler, s);
+        r = sd_event_add_time_relative(s->event, &source, CLOCK_MONOTONIC, IDLE_TIMEOUT_USEC, 0, server_idle_handler, s);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate idle timer: %m");
 
@@ -2146,7 +2136,6 @@ int server_start_or_stop_idle_timer(Server *s) {
 }
 
 int server_refresh_idle_timer(Server *s) {
-        usec_t when;
         int r;
 
         assert(s);
@@ -2154,11 +2143,7 @@ int server_refresh_idle_timer(Server *s) {
         if (!s->idle_event_source)
                 return 0;
 
-        r = sd_event_now(s->event, CLOCK_MONOTONIC, &when);
-        if (r < 0)
-                return log_error_errno(r, "Failed to determine current time: %m");
-
-        r = sd_event_source_set_time(s->idle_event_source, usec_add(when, IDLE_TIMEOUT_USEC));
+        r = sd_event_source_set_time_relative(s->idle_event_source, IDLE_TIMEOUT_USEC);
         if (r < 0)
                 return log_error_errno(r, "Failed to refresh idle timer: %m");
 
@@ -2205,6 +2190,8 @@ int server_init(Server *s, const char *namespace) {
                 .compress.enabled = true,
                 .compress.threshold_bytes = (uint64_t) -1,
                 .seal = true,
+
+                .set_audit = true,
 
                 .watchdog_usec = USEC_INFINITY,
 

@@ -8,6 +8,7 @@
 #include "io-util.h"
 #include "missing_network.h"
 #include "resolved-dns-stream.h"
+#include "resolved-manager.h"
 
 #define DNS_STREAM_TIMEOUT_USEC (10 * USEC_PER_SEC)
 #define DNS_STREAMS_MAX 128
@@ -86,11 +87,9 @@ static int dns_stream_complete(DnsStream *s, int error) {
 }
 
 static int dns_stream_identify(DnsStream *s) {
-        union {
-                struct cmsghdr header; /* For alignment */
-                uint8_t buffer[CMSG_SPACE(MAXSIZE(struct in_pktinfo, struct in6_pktinfo))
-                               + EXTRA_CMSG_SPACE /* kernel appears to require extra space */];
-        } control;
+        CMSG_BUFFER_TYPE(CMSG_SPACE(MAXSIZE(struct in_pktinfo, struct in6_pktinfo))
+                         + CMSG_SPACE(int) + /* for the TTL */
+                         + EXTRA_CMSG_SPACE /* kernel appears to require extra space */) control;
         struct msghdr mh = {};
         struct cmsghdr *cmsg;
         socklen_t sl;
@@ -191,7 +190,7 @@ static int dns_stream_identify(DnsStream *s) {
                 s->ifindex = manager_find_ifindex(s->manager, s->local.sa.sa_family, s->local.sa.sa_family == AF_INET ? (union in_addr_union*) &s->local.in.sin_addr : (union in_addr_union*)  &s->local.in6.sin6_addr);
 
         if (s->protocol == DNS_PROTOCOL_LLMNR && s->ifindex > 0) {
-                uint32_t ifindex = htobe32(s->ifindex);
+                be32_t ifindex = htobe32(s->ifindex);
 
                 /* Make sure all packets for this connection are sent on the same interface */
                 if (s->local.sa.sa_family == AF_INET) {
@@ -446,7 +445,7 @@ static int on_stream_io(sd_event_source *es, int fd, uint32_t revents, void *use
 
         /* If we did something, let's restart the timeout event source */
         if (progressed && s->timeout_event_source) {
-                r = sd_event_source_set_time(s->timeout_event_source, now(clock_boottime_or_monotonic()) + DNS_STREAM_TIMEOUT_USEC);
+                r = sd_event_source_set_time_relative(s->timeout_event_source, DNS_STREAM_TIMEOUT_USEC);
                 if (r < 0)
                         log_warning_errno(errno, "Couldn't restart TCP connection timeout, ignoring: %m");
         }
@@ -529,11 +528,11 @@ int dns_stream_new(
 
         (void) sd_event_source_set_description(s->io_event_source, "dns-stream-io");
 
-        r = sd_event_add_time(
+        r = sd_event_add_time_relative(
                         m->event,
                         &s->timeout_event_source,
                         clock_boottime_or_monotonic(),
-                        now(clock_boottime_or_monotonic()) + DNS_STREAM_TIMEOUT_USEC, 0,
+                        DNS_STREAM_TIMEOUT_USEC, 0,
                         on_stream_timeout, s);
         if (r < 0)
                 return r;

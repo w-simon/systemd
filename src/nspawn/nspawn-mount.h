@@ -16,6 +16,9 @@ typedef enum MountSettingsMask {
         MOUNT_APPLY_TMPFS_TMP    = 1 << 5, /* if set, /tmp will be mounted as tmpfs */
         MOUNT_ROOT_ONLY          = 1 << 6, /* if set, only root mounts are mounted */
         MOUNT_NON_ROOT_ONLY      = 1 << 7, /* if set, only non-root mounts are mounted */
+        MOUNT_MKDIR              = 1 << 8, /* if set, make directory to mount over first */
+        MOUNT_TOUCH              = 1 << 9, /* if set, touch file to mount over first */
+        MOUNT_PREFIX_ROOT        = 1 << 10,/* if set, prefix the source path with the container's root directory */
 } MountSettingsMask;
 
 typedef enum CustomMountType {

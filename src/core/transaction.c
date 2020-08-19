@@ -279,7 +279,7 @@ static int transaction_merge_jobs(Transaction *tr, sd_bus_error *e) {
         return 0;
 }
 
-static void transaction_drop_redundant(Transaction *tr, unsigned generation) {
+static void transaction_drop_redundant(Transaction *tr) {
         bool again;
 
         /* Goes through the transaction and removes all jobs of the units whose jobs are all noops. If not
@@ -299,7 +299,7 @@ static void transaction_drop_redundant(Transaction *tr, unsigned generation) {
 
                         LIST_FOREACH(transaction, k, j)
                                 if (tr->anchor_job == k ||
-                                    !job_is_redundant(k, generation) ||
+                                    !job_type_is_redundant(k->type, unit_active_state(k->unit)) ||
                                     (k->unit->job && job_type_is_conflicting(k->type, k->unit->job->type))) {
                                         keep = true;
                                         break;
@@ -336,9 +336,8 @@ static char* merge_unit_ids(const char* unit_log_field, char **pairs) {
 
         STRV_FOREACH_PAIR(unit_id, job_type, pairs) {
                 next = strlen(unit_log_field) + strlen(*unit_id);
-                if (!GREEDY_REALLOC(ans, alloc, size + next + 1)) {
+                if (!GREEDY_REALLOC(ans, alloc, size + next + 1))
                         return mfree(ans);
-                }
 
                 sprintf(ans + size, "%s%s", unit_log_field, *unit_id);
                 if (*(unit_id+1))
@@ -425,7 +424,9 @@ static int transaction_verify_order_one(Transaction *tr, Job *j, Job *from, unsi
                         else
                                 status = " SKIP ";
 
-                        unit_status_printf(delete->unit, status,
+                        unit_status_printf(delete->unit,
+                                           STATUS_TYPE_NOTICE,
+                                           status,
                                            "Ordering cycle found, skipping %s");
                         transaction_delete_unit(tr, delete->unit);
                         return -EAGAIN;
@@ -655,6 +656,10 @@ static int transaction_apply(
                 assert(!j->transaction_prev);
                 assert(!j->transaction_next);
 
+                r = hashmap_ensure_allocated(&m->jobs, NULL);
+                if (r < 0)
+                        return r;
+
                 r = hashmap_put(m->jobs, UINT32_TO_PTR(j->id), j);
                 if (r < 0)
                         goto rollback;
@@ -730,7 +735,7 @@ int transaction_activate(
                 transaction_minimize_impact(tr);
 
         /* Third step: Drop redundant jobs */
-        transaction_drop_redundant(tr, generation++);
+        transaction_drop_redundant(tr);
 
         for (;;) {
                 /* Fourth step: Let's remove unneeded jobs that might
@@ -772,7 +777,7 @@ int transaction_activate(
         }
 
         /* Eights step: Drop redundant jobs again, if the merging now allows us to drop more. */
-        transaction_drop_redundant(tr, generation++);
+        transaction_drop_redundant(tr);
 
         /* Ninth step: check whether we can actually apply this */
         r = transaction_is_destructive(tr, mode, e);
@@ -949,6 +954,25 @@ int transaction_add_job_and_dependencies(
 
         if (type != JOB_STOP) {
                 r = bus_unit_validate_load_state(unit, e);
+                /* The time-based cache allows to start new units without daemon-reload,
+                 * but if they are already referenced (because of dependencies or ordering)
+                 * then we have to force a load of the fragment. As an optimization, check
+                 * first if anything in the usual paths was modified since the last time
+                 * the cache was loaded. Also check if the last time an attempt to load the
+                 * unit was made was before the most recent cache refresh, so that we know
+                 * we need to try again - even if the cache is current, it might have been
+                 * updated in a different context before we had a chance to retry loading
+                 * this particular unit.
+                 * Given building up the transaction is a synchronous operation, attempt
+                 * to load the unit immediately. */
+                if (r < 0 && manager_unit_file_maybe_loadable_from_cache(unit)) {
+                        sd_bus_error_free(e);
+                        unit->load_state = UNIT_STUB;
+                        r = unit_load(unit);
+                        if (r < 0 || unit->load_state == UNIT_STUB)
+                                unit->load_state = UNIT_NOT_FOUND;
+                        r = bus_unit_validate_load_state(unit, e);
+                }
                 if (r < 0)
                         return r;
         }

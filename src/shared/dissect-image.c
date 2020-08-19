@@ -9,6 +9,7 @@
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
+#include <sysexits.h>
 
 #include "sd-device.h"
 #include "sd-id128.h"
@@ -33,8 +34,10 @@
 #include "hexdecoct.h"
 #include "hostname-util.h"
 #include "id128-util.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
+#include "namespace-util.h"
 #include "nulstr-util.h"
 #include "os-util.h"
 #include "path-util.h"
@@ -75,10 +78,9 @@ int probe_filesystem(const char *node, char **ret_fstype) {
                 log_debug("No type detected on partition %s", node);
                 goto not_found;
         }
-        if (r == -2) {
-                log_debug("Results ambiguous for partition %s", node);
-                return -EUCLEAN;
-        }
+        if (r == -2)
+                return log_debug_errno(SYNTHETIC_ERRNO(EUCLEAN),
+                                       "Results ambiguous for partition %s", node);
         if (r != 0)
                 return errno_or_else(EIO);
 
@@ -214,22 +216,18 @@ static int wait_for_partitions_to_appear(
                         break;
                 r = -errno;
                 if (r == -EINVAL) {
-                        struct loop_info64 info;
+                        /* If we are running on a block device that has partition scanning off, return an
+                         * explicit recognizable error about this, so that callers can generate a proper
+                         * message explaining the situation. */
 
-                        /* If we are running on a loop device that has partition scanning off, return
-                         * an explicit recognizable error about this, so that callers can generate a
-                         * proper message explaining the situation. */
+                        r = blockdev_partscan_enabled(fd);
+                        if (r < 0)
+                                return r;
+                        if (r == 0)
+                                return log_debug_errno(EPROTONOSUPPORT,
+                                                       "Device is a loop device and partition scanning is off!");
 
-                        if (ioctl(fd, LOOP_GET_STATUS64, &info) >= 0) {
-#if HAVE_VALGRIND_MEMCHECK_H
-                                /* Valgrind currently doesn't know LOOP_GET_STATUS64. Remove this once it does */
-                                VALGRIND_MAKE_MEM_DEFINED(&info, sizeof(info));
-#endif
-
-                                if ((info.lo_flags & LO_FLAGS_PARTSCAN) == 0)
-                                        return log_debug_errno(EPROTONOSUPPORT,
-                                                               "Device is a loop device and partition scanning is off!");
-                        }
+                        return -EINVAL; /* original error */
                 }
                 if (r != -EBUSY)
                         return r;
@@ -308,6 +306,8 @@ int dissect_image(
                 int fd,
                 const void *root_hash,
                 size_t root_hash_size,
+                const char *verity_data,
+                const MountOptions *mount_options,
                 DissectImageFlags flags,
                 DissectedImage **ret) {
 
@@ -330,6 +330,7 @@ int dissect_image(
         assert(fd >= 0);
         assert(ret);
         assert(root_hash || root_hash_size == 0);
+        assert(!((flags & DISSECT_IMAGE_GPT_ONLY) && (flags & DISSECT_IMAGE_NO_PARTITION_TABLE)));
 
         /* Probes a disk image, and returns information about what it found in *ret.
          *
@@ -392,14 +393,15 @@ int dissect_image(
         if (r < 0)
                 return r;
 
-        if (!(flags & DISSECT_IMAGE_GPT_ONLY) &&
-            (flags & DISSECT_IMAGE_REQUIRE_ROOT)) {
+        if ((!(flags & DISSECT_IMAGE_GPT_ONLY) &&
+            (flags & DISSECT_IMAGE_REQUIRE_ROOT)) ||
+            (flags & DISSECT_IMAGE_NO_PARTITION_TABLE)) {
                 const char *usage = NULL;
 
                 (void) blkid_probe_lookup_value(b, "USAGE", &usage, NULL);
                 if (STRPTR_IN_SET(usage, "filesystem", "crypto")) {
-                        _cleanup_free_ char *t = NULL, *n = NULL;
-                        const char *fstype = NULL;
+                        _cleanup_free_ char *t = NULL, *n = NULL, *o = NULL;
+                        const char *fstype = NULL, *options = NULL;
 
                         /* OK, we have found a file system, that's our root partition then. */
                         (void) blkid_probe_lookup_value(b, "TYPE", &fstype, NULL);
@@ -414,21 +416,34 @@ int dissect_image(
                         if (r < 0)
                                 return r;
 
+                        m->single_file_system = true;
+                        m->verity = root_hash && verity_data;
+                        m->can_verity = !!verity_data;
+
+                        options = mount_options_from_part(mount_options, 0);
+                        if (options) {
+                                o = strdup(options);
+                                if (!o)
+                                        return -ENOMEM;
+                        }
+
                         m->partitions[PARTITION_ROOT] = (DissectedPartition) {
                                 .found = true,
-                                .rw = true,
+                                .rw = !m->verity,
                                 .partno = -1,
                                 .architecture = _ARCHITECTURE_INVALID,
                                 .fstype = TAKE_PTR(t),
                                 .node = TAKE_PTR(n),
+                                .mount_options = TAKE_PTR(o),
                         };
 
                         m->encrypted = streq_ptr(fstype, "crypto_LUKS");
 
+                        /* Even on a single partition we need to wait for udev to create the
+                         * /dev/block/X:Y symlink to /dev/loopZ */
                         r = loop_wait_for_partitions_to_appear(fd, d, 0, flags, &e);
                         if (r < 0)
                                 return r;
-
                         *ret = TAKE_PTR(m);
 
                         return 0;
@@ -684,7 +699,8 @@ int dissect_image(
                         }
 
                         if (designator != _PARTITION_DESIGNATOR_INVALID) {
-                                _cleanup_free_ char *t = NULL, *n = NULL;
+                                _cleanup_free_ char *t = NULL, *n = NULL, *o = NULL;
+                                const char *options = NULL;
 
                                 /* First one wins */
                                 if (m->partitions[designator].found)
@@ -700,6 +716,13 @@ int dissect_image(
                                 if (!n)
                                         return -ENOMEM;
 
+                                options = mount_options_from_part(mount_options, nr);
+                                if (options) {
+                                        o = strdup(options);
+                                        if (!o)
+                                                return -ENOMEM;
+                                }
+
                                 m->partitions[designator] = (DissectedPartition) {
                                         .found = true,
                                         .partno = nr,
@@ -708,6 +731,7 @@ int dissect_image(
                                         .node = TAKE_PTR(n),
                                         .fstype = TAKE_PTR(t),
                                         .uuid = id,
+                                        .mount_options = TAKE_PTR(o),
                                 };
                         }
 
@@ -733,9 +757,9 @@ int dissect_image(
                                 break;
 
                         case 0xEA: { /* Boot Loader Spec extended $BOOT partition */
-                                _cleanup_free_ char *n = NULL;
+                                _cleanup_free_ char *n = NULL, *o = NULL;
                                 sd_id128_t id = SD_ID128_NULL;
-                                const char *sid;
+                                const char *sid, *options = NULL;
 
                                 /* First one wins */
                                 if (m->partitions[PARTITION_XBOOTLDR].found)
@@ -749,6 +773,13 @@ int dissect_image(
                                 if (!n)
                                         return -ENOMEM;
 
+                                options = mount_options_from_part(mount_options, nr);
+                                if (options) {
+                                        o = strdup(options);
+                                        if (!o)
+                                                return -ENOMEM;
+                                }
+
                                 m->partitions[PARTITION_XBOOTLDR] = (DissectedPartition) {
                                         .found = true,
                                         .partno = nr,
@@ -756,6 +787,7 @@ int dissect_image(
                                         .architecture = _ARCHITECTURE_INVALID,
                                         .node = TAKE_PTR(n),
                                         .uuid = id,
+                                        .mount_options = TAKE_PTR(o),
                                 };
 
                                 break;
@@ -778,6 +810,8 @@ int dissect_image(
                         zero(m->partitions[PARTITION_ROOT_SECONDARY_VERITY]);
 
                 } else if (flags & DISSECT_IMAGE_REQUIRE_ROOT) {
+                        _cleanup_free_ char *o = NULL;
+                        const char *options = NULL;
 
                         /* If the root has was set, then we won't fallback to a generic node, because the root hash
                          * decides */
@@ -793,6 +827,13 @@ int dissect_image(
                         if (multiple_generic)
                                 return -ENOTUNIQ;
 
+                        options = mount_options_from_part(mount_options, generic_nr);
+                        if (options) {
+                                o = strdup(options);
+                                if (!o)
+                                        return -ENOMEM;
+                        }
+
                         m->partitions[PARTITION_ROOT] = (DissectedPartition) {
                                 .found = true,
                                 .rw = generic_rw,
@@ -800,6 +841,7 @@ int dissect_image(
                                 .architecture = _ARCHITECTURE_INVALID,
                                 .node = TAKE_PTR(generic_node),
                                 .uuid = generic_uuid,
+                                .mount_options = TAKE_PTR(o),
                         };
                 }
         }
@@ -862,6 +904,7 @@ DissectedImage* dissected_image_unref(DissectedImage *m) {
                 free(m->partitions[i].node);
                 free(m->partitions[i].decrypted_fstype);
                 free(m->partitions[i].decrypted_node);
+                free(m->partitions[i].mount_options);
         }
 
         free(m->hostname);
@@ -961,9 +1004,9 @@ static int mount_partition(
         if (!m->found || !node || !fstype)
                 return 0;
 
-        /* Stacked encryption? Yuck */
+        /* We are looking at an encrypted partition? This either means stacked encryption, or the caller didn't call dissected_image_decrypt() beforehand. Let's return a recognizable error for this case. */
         if (streq_ptr(fstype, "crypto_LUKS"))
-                return -ELOOP;
+                return -EUNATCH;
 
         rw = m->rw && !(flags & DISSECT_IMAGE_READ_ONLY);
 
@@ -1001,6 +1044,16 @@ static int mount_partition(
                         return -ENOMEM;
         }
 
+        if (!isempty(m->mount_options))
+                if (!strextend_with_separator(&options, ",", m->mount_options, NULL))
+                        return -ENOMEM;
+
+        if (FLAGS_SET(flags, DISSECT_IMAGE_MKDIR)) {
+                r = mkdir_p(p, 0755);
+                if (r < 0)
+                        return r;
+        }
+
         r = mount_verbose(LOG_DEBUG, node, p, fstype, MS_NODEV|(rw ? 0 : MS_RDONLY), options);
         if (r < 0)
                 return r;
@@ -1013,6 +1066,15 @@ int dissected_image_mount(DissectedImage *m, const char *where, uid_t uid_shift,
 
         assert(m);
         assert(where);
+
+        /* Returns:
+         *
+         *  -ENXIO        → No root partition found
+         *  -EMEDIUMTYPE  → DISSECT_IMAGE_VALIDATE_OS set but no os-release file found
+         *  -EUNATCH      → Encrypted partition found for which no dm-crypt was set up yet
+         *  -EUCLEAN      → fsck for file system failed
+         *  -EBUSY        → File system already mounted/used elsewhere (kernel)
+         */
 
         if (!m->partitions[PARTITION_ROOT].found)
                 return -ENXIO;
@@ -1033,6 +1095,10 @@ int dissected_image_mount(DissectedImage *m, const char *where, uid_t uid_shift,
 
         if (flags & DISSECT_IMAGE_MOUNT_ROOT_ONLY)
                 return 0;
+
+        /* Mask DISSECT_IMAGE_MKDIR for all subdirs: the idea is that only the top-level mount point is
+         * created if needed, but the image itself not modified. */
+        flags &= ~DISSECT_IMAGE_MKDIR;
 
         r = mount_partition(m->partitions + PARTITION_HOME, where, "/home", uid_shift, flags);
         if (r < 0)
@@ -1077,6 +1143,29 @@ int dissected_image_mount(DissectedImage *m, const char *where, uid_t uid_shift,
         }
 
         return 0;
+}
+
+int dissected_image_mount_and_warn(DissectedImage *m, const char *where, uid_t uid_shift, DissectImageFlags flags) {
+        int r;
+
+        assert(m);
+        assert(where);
+
+        r = dissected_image_mount(m, where, uid_shift, flags);
+        if (r == -ENXIO)
+                return log_error_errno(r, "Not root file system found in image.");
+        if (r == -EMEDIUMTYPE)
+                return log_error_errno(r, "No suitable os-release file in image found.");
+        if (r == -EUNATCH)
+                return log_error_errno(r, "Encrypted file system discovered, but decryption not requested.");
+        if (r == -EUCLEAN)
+                return log_error_errno(r, "File system check on image failed.");
+        if (r == -EBUSY)
+                return log_error_errno(r, "File system already mounted elsewhere.");
+        if (r < 0)
+                return log_error_errno(r, "Failed to mount image: %m");
+
+        return r;
 }
 
 #if HAVE_LIBCRYPTSETUP
@@ -1133,8 +1222,9 @@ static int make_dm_name_and_node(const void *original_node, const char *suffix, 
 
         base = strrchr(original_node, '/');
         if (!base)
-                return -EINVAL;
-        base++;
+                base = original_node;
+        else
+                base++;
         if (isempty(base))
                 return -EINVAL;
 
@@ -1187,6 +1277,8 @@ static int decrypt_partition(
         if (r < 0)
                 return log_debug_errno(r, "Failed to initialize dm-crypt: %m");
 
+        cryptsetup_enable_logging(cd);
+
         r = crypt_load(cd, CRYPT_LUKS, NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to load LUKS metadata: %m");
@@ -1208,42 +1300,106 @@ static int decrypt_partition(
         return 0;
 }
 
+static int verity_can_reuse(const void *root_hash, size_t root_hash_size, bool has_sig, const char *name, struct crypt_device **ret_cd) {
+        /* If the same volume was already open, check that the root hashes match, and reuse it if they do */
+        _cleanup_free_ char *root_hash_existing = NULL;
+        _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
+        struct crypt_params_verity crypt_params = {};
+        size_t root_hash_existing_size = root_hash_size;
+        int r;
+
+        assert(ret_cd);
+
+        r = crypt_init_by_name(&cd, name);
+        if (r < 0)
+                return log_debug_errno(r, "Error opening verity device, crypt_init_by_name failed: %m");
+        r = crypt_get_verity_info(cd, &crypt_params);
+        if (r < 0)
+                return log_debug_errno(r, "Error opening verity device, crypt_get_verity_info failed: %m");
+        root_hash_existing = malloc0(root_hash_size);
+        if (!root_hash_existing)
+                return -ENOMEM;
+        r = crypt_volume_key_get(cd, CRYPT_ANY_SLOT, root_hash_existing, &root_hash_existing_size, NULL, 0);
+        if (r < 0)
+                return log_debug_errno(r, "Error opening verity device, crypt_volume_key_get failed: %m");
+        if (root_hash_size != root_hash_existing_size || memcmp(root_hash_existing, root_hash, root_hash_size) != 0)
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Error opening verity device, it already exists but root hashes are different.");
+#if HAVE_CRYPT_ACTIVATE_BY_SIGNED_KEY
+        /* Ensure that, if signatures are supported, we only reuse the device if the previous mount
+         * used the same settings, so that a previous unsigned mount will not be reused if the user
+         * asks to use signing for the new one, and viceversa. */
+        if (has_sig != !!(crypt_params.flags & CRYPT_VERITY_ROOT_HASH_SIGNATURE))
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Error opening verity device, it already exists but signature settings are not the same.");
+#endif
+
+        *ret_cd = TAKE_PTR(cd);
+        return 0;
+}
+
+static inline void dm_deferred_remove_clean(char *name) {
+        if (!name)
+                return;
+        (void) crypt_deactivate_by_name(NULL, name, CRYPT_DEACTIVATE_DEFERRED);
+        free(name);
+}
+DEFINE_TRIVIAL_CLEANUP_FUNC(char *, dm_deferred_remove_clean);
+
 static int verity_partition(
                 DissectedPartition *m,
                 DissectedPartition *v,
                 const void *root_hash,
                 size_t root_hash_size,
+                const char *verity_data,
+                const char *root_hash_sig_path,
+                const void *root_hash_sig,
+                size_t root_hash_sig_size,
                 DissectImageFlags flags,
                 DecryptedImage *d) {
 
-        _cleanup_free_ char *node = NULL, *name = NULL;
+        _cleanup_free_ char *node = NULL, *name = NULL, *hash_sig_from_file = NULL;
         _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
+        _cleanup_(dm_deferred_remove_cleanp) char *restore_deferred_remove = NULL;
         int r;
 
         assert(m);
-        assert(v);
+        assert(v || verity_data);
 
         if (!root_hash)
                 return 0;
 
         if (!m->found || !m->node || !m->fstype)
                 return 0;
-        if (!v->found || !v->node || !v->fstype)
-                return 0;
+        if (!verity_data) {
+                if (!v->found || !v->node || !v->fstype)
+                        return 0;
 
-        if (!streq(v->fstype, "DM_verity_hash"))
-                return 0;
+                if (!streq(v->fstype, "DM_verity_hash"))
+                        return 0;
+        }
 
-        r = make_dm_name_and_node(m->node, "-verity", &name, &node);
+        if (FLAGS_SET(flags, DISSECT_IMAGE_VERITY_SHARE)) {
+                /* Use the roothash, which is unique per volume, as the device node name, so that it can be reused */
+                _cleanup_free_ char *root_hash_encoded = NULL;
+                root_hash_encoded = hexmem(root_hash, root_hash_size);
+                if (!root_hash_encoded)
+                        return -ENOMEM;
+                r = make_dm_name_and_node(root_hash_encoded, "-verity", &name, &node);
+        } else
+                r = make_dm_name_and_node(m->node, "-verity", &name, &node);
         if (r < 0)
                 return r;
 
-        if (!GREEDY_REALLOC0(d->decrypted, d->n_allocated, d->n_decrypted + 1))
-                return -ENOMEM;
+        if (!root_hash_sig && root_hash_sig_path) {
+                r = read_full_file_full(AT_FDCWD, root_hash_sig_path, 0, &hash_sig_from_file, &root_hash_sig_size);
+                if (r < 0)
+                        return r;
+        }
 
-        r = crypt_init(&cd, v->node);
+        r = crypt_init(&cd, verity_data ?: v->node);
         if (r < 0)
                 return r;
+
+        cryptsetup_enable_logging(cd);
 
         r = crypt_load(cd, CRYPT_VERITY, NULL);
         if (r < 0)
@@ -1253,9 +1409,84 @@ static int verity_partition(
         if (r < 0)
                 return r;
 
-        r = crypt_activate_by_volume_key(cd, name, root_hash, root_hash_size, CRYPT_ACTIVATE_READONLY);
-        if (r < 0)
-                return r;
+        if (!GREEDY_REALLOC0(d->decrypted, d->n_allocated, d->n_decrypted + 1))
+                return -ENOMEM;
+
+        /* If activating fails because the device already exists, check the metadata and reuse it if it matches.
+         * In case of ENODEV/ENOENT, which can happen if another process is activating at the exact same time,
+         * retry a few times before giving up. */
+        for (unsigned i = 0; i < N_DEVICE_NODE_LIST_ATTEMPTS; i++) {
+                if (root_hash_sig || hash_sig_from_file) {
+#if HAVE_CRYPT_ACTIVATE_BY_SIGNED_KEY
+                        r = crypt_activate_by_signed_key(cd, name, root_hash, root_hash_size, root_hash_sig ?: hash_sig_from_file, root_hash_sig_size, CRYPT_ACTIVATE_READONLY);
+#else
+                        r = log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "activation of verity device with signature requested, but not supported by cryptsetup due to missing crypt_activate_by_signed_key()");
+#endif
+                } else
+                        r = crypt_activate_by_volume_key(cd, name, root_hash, root_hash_size, CRYPT_ACTIVATE_READONLY);
+                /* libdevmapper can return EINVAL when the device is already in the activation stage.
+                 * There's no way to distinguish this situation from a genuine error due to invalid
+                 * parameters, so immediately fallback to activating the device with a unique name.
+                 * Improvements in libcrypsetup can ensure this never happens: https://gitlab.com/cryptsetup/cryptsetup/-/merge_requests/96 */
+                if (r == -EINVAL && FLAGS_SET(flags, DISSECT_IMAGE_VERITY_SHARE))
+                        return verity_partition(m, v, root_hash, root_hash_size, verity_data, NULL, root_hash_sig ?: hash_sig_from_file, root_hash_sig_size, flags & ~DISSECT_IMAGE_VERITY_SHARE, d);
+                if (!IN_SET(r,
+                            0, /* Success */
+                            -EEXIST, /* Volume is already open and ready to be used */
+                            -EBUSY, /* Volume is being opened but not ready, crypt_init_by_name can fetch details */
+                            -ENODEV /* Volume is being opened but not ready, crypt_init_by_name would fail, try to open again */))
+                        return r;
+                if (IN_SET(r, -EEXIST, -EBUSY)) {
+                        struct crypt_device *existing_cd = NULL;
+
+                        if (!restore_deferred_remove){
+                                /* To avoid races, disable automatic removal on umount while setting up the new device. Restore it on failure. */
+                                r = dm_deferred_remove_cancel(name);
+                                /* If activation returns EBUSY there might be no deferred removal to cancel, that's fine */
+                                if (r < 0 && r != -ENXIO)
+                                        return log_debug_errno(r, "Disabling automated deferred removal for verity device %s failed: %m", node);
+                                if (r == 0) {
+                                        restore_deferred_remove = strdup(name);
+                                        if (!restore_deferred_remove)
+                                                return -ENOMEM;
+                                }
+                        }
+
+                        r = verity_can_reuse(root_hash, root_hash_size, !!root_hash_sig || !!hash_sig_from_file, name, &existing_cd);
+                        /* Same as above, -EINVAL can randomly happen when it actually means -EEXIST */
+                        if (r == -EINVAL && FLAGS_SET(flags, DISSECT_IMAGE_VERITY_SHARE))
+                                return verity_partition(m, v, root_hash, root_hash_size, verity_data, NULL, root_hash_sig ?: hash_sig_from_file, root_hash_sig_size, flags & ~DISSECT_IMAGE_VERITY_SHARE, d);
+                        if (!IN_SET(r, 0, -ENODEV, -ENOENT, -EBUSY))
+                                return log_debug_errno(r, "Checking whether existing verity device %s can be reused failed: %m", node);
+                        if (r == 0) {
+                                /* devmapper might say that the device exists, but the devlink might not yet have been
+                                 * created. Check and wait for the udev event in that case. */
+                                r = device_wait_for_devlink(node, "block", 100 * USEC_PER_MSEC, NULL);
+                                /* Fallback to activation with a unique device if it's taking too long */
+                                if (r == -ETIMEDOUT)
+                                        break;
+                                if (r < 0)
+                                        return r;
+
+                                if (cd)
+                                        crypt_free(cd);
+                                cd = existing_cd;
+                        }
+                }
+                if (r == 0)
+                        break;
+
+                /* Device is being opened by another process, but it has not finished yet, yield for 2ms */
+                (void) usleep(2 * USEC_PER_MSEC);
+        }
+
+        /* An existing verity device was reported by libcryptsetup/libdevmapper, but we can't use it at this time.
+         * Fall back to activating it with a unique device name. */
+        if (r != 0 && FLAGS_SET(flags, DISSECT_IMAGE_VERITY_SHARE))
+                return verity_partition(m, v, root_hash, root_hash_size, verity_data, NULL, root_hash_sig ?: hash_sig_from_file, root_hash_sig_size, flags & ~DISSECT_IMAGE_VERITY_SHARE, d);
+
+        /* Everything looks good and we'll be able to mount the device, so deferred remove will be re-enabled at that point. */
+        restore_deferred_remove = mfree(restore_deferred_remove);
 
         d->decrypted[d->n_decrypted].name = TAKE_PTR(name);
         d->decrypted[d->n_decrypted].device = TAKE_PTR(cd);
@@ -1272,6 +1503,10 @@ int dissected_image_decrypt(
                 const char *passphrase,
                 const void *root_hash,
                 size_t root_hash_size,
+                const char *verity_data,
+                const char *root_hash_sig_path,
+                const void *root_hash_sig,
+                size_t root_hash_sig_size,
                 DissectImageFlags flags,
                 DecryptedImage **ret) {
 
@@ -1318,7 +1553,7 @@ int dissected_image_decrypt(
 
                 k = PARTITION_VERITY_OF(i);
                 if (k >= 0) {
-                        r = verity_partition(p, m->partitions + k, root_hash, root_hash_size, flags, d);
+                        r = verity_partition(p, m->partitions + k, root_hash, root_hash_size, verity_data, root_hash_sig_path, root_hash_sig, root_hash_sig_size, flags | DISSECT_IMAGE_VERITY_SHARE, d);
                         if (r < 0)
                                 return r;
                 }
@@ -1343,6 +1578,10 @@ int dissected_image_decrypt_interactively(
                 const char *passphrase,
                 const void *root_hash,
                 size_t root_hash_size,
+                const char *verity_data,
+                const char *root_hash_sig_path,
+                const void *root_hash_sig,
+                size_t root_hash_sig_size,
                 DissectImageFlags flags,
                 DecryptedImage **ret) {
 
@@ -1353,7 +1592,7 @@ int dissected_image_decrypt_interactively(
                 n--;
 
         for (;;) {
-                r = dissected_image_decrypt(m, passphrase, root_hash, root_hash_size, flags, ret);
+                r = dissected_image_decrypt(m, passphrase, root_hash, root_hash_size, verity_data, root_hash_sig_path, root_hash_sig, root_hash_sig_size, flags, ret);
                 if (r >= 0)
                         return r;
                 if (r == -EKEYREJECTED)
@@ -1394,7 +1633,7 @@ int decrypted_image_relinquish(DecryptedImage *d) {
                 if (p->relinquished)
                         continue;
 
-                r = dm_deferred_remove(p->name);
+                r = crypt_deactivate_by_name(NULL, p->name, CRYPT_DEACTIVATE_DEFERRED);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to mark %s for auto-removal: %m", p->name);
 
@@ -1405,56 +1644,126 @@ int decrypted_image_relinquish(DecryptedImage *d) {
         return 0;
 }
 
-int root_hash_load(const char *image, void **ret, size_t *ret_size) {
-        _cleanup_free_ char *text = NULL;
-        _cleanup_free_ void *k = NULL;
-        size_t l;
+int verity_metadata_load(
+                const char *image,
+                const char *root_hash_path,
+                void **ret_roothash,
+                size_t *ret_roothash_size,
+                char **ret_verity_data,
+                char **ret_roothashsig) {
+
+        _cleanup_free_ char *verity_filename = NULL, *roothashsig_filename = NULL;
+        _cleanup_free_ void *roothash_decoded = NULL;
+        size_t roothash_decoded_size = 0;
         int r;
 
         assert(image);
-        assert(ret);
-        assert(ret_size);
 
         if (is_device_path(image)) {
                 /* If we are asked to load the root hash for a device node, exit early */
-                *ret = NULL;
-                *ret_size = 0;
+                if (ret_roothash)
+                        *ret_roothash = NULL;
+                if (ret_roothash_size)
+                        *ret_roothash_size = 0;
+                if (ret_verity_data)
+                        *ret_verity_data = NULL;
+                if (ret_roothashsig)
+                        *ret_roothashsig = NULL;
                 return 0;
         }
 
-        r = getxattr_malloc(image, "user.verity.roothash", &text, true);
-        if (r < 0) {
-                char *fn, *e, *n;
+        if (ret_verity_data) {
+                char *e;
 
-                if (!IN_SET(r, -ENODATA, -EOPNOTSUPP, -ENOENT))
-                        return r;
-
-                fn = newa(char, strlen(image) + STRLEN(".roothash") + 1);
-                n = stpcpy(fn, image);
-                e = endswith(fn, ".raw");
+                verity_filename = new(char, strlen(image) + STRLEN(".verity") + 1);
+                if (!verity_filename)
+                        return -ENOMEM;
+                strcpy(verity_filename, image);
+                e = endswith(verity_filename, ".raw");
                 if (e)
-                        n = e;
+                        strcpy(e, ".verity");
+                else
+                        strcat(verity_filename, ".verity");
 
-                strcpy(n, ".roothash");
-
-                r = read_one_line_file(fn, &text);
-                if (r == -ENOENT) {
-                        *ret = NULL;
-                        *ret_size = 0;
-                        return 0;
+                r = access(verity_filename, F_OK);
+                if (r < 0) {
+                        if (errno != ENOENT)
+                                return -errno;
+                        verity_filename = mfree(verity_filename);
                 }
-                if (r < 0)
-                        return r;
         }
 
-        r = unhexmem(text, strlen(text), &k, &l);
-        if (r < 0)
-                return r;
-        if (l < sizeof(sd_id128_t))
-                return -EINVAL;
+        if (ret_roothashsig) {
+                char *e;
 
-        *ret = TAKE_PTR(k);
-        *ret_size = l;
+                /* Follow naming convention recommended by the relevant RFC:
+                 * https://tools.ietf.org/html/rfc5751#section-3.2.1 */
+                roothashsig_filename = new(char, strlen(image) + STRLEN(".roothash.p7s") + 1);
+                if (!roothashsig_filename)
+                        return -ENOMEM;
+                strcpy(roothashsig_filename, image);
+                e = endswith(roothashsig_filename, ".raw");
+                if (e)
+                        strcpy(e, ".roothash.p7s");
+                else
+                        strcat(roothashsig_filename, ".roothash.p7s");
+
+                r = access(roothashsig_filename, R_OK);
+                if (r < 0) {
+                        if (errno != ENOENT)
+                                return -errno;
+                        roothashsig_filename = mfree(roothashsig_filename);
+                }
+        }
+
+        if (ret_roothash) {
+                _cleanup_free_ char *text = NULL;
+                assert(ret_roothash_size);
+
+                if (root_hash_path) {
+                        /* We have the path to a roothash to load and decode, eg: RootHash=/foo/bar.roothash */
+                        r = read_one_line_file(root_hash_path, &text);
+                        if (r < 0)
+                                return r;
+                } else {
+                        r = getxattr_malloc(image, "user.verity.roothash", &text, true);
+                        if (r < 0) {
+                                char *fn, *e, *n;
+
+                                if (!IN_SET(r, -ENODATA, -EOPNOTSUPP, -ENOENT))
+                                        return r;
+
+                                fn = newa(char, strlen(image) + STRLEN(".roothash") + 1);
+                                n = stpcpy(fn, image);
+                                e = endswith(fn, ".raw");
+                                if (e)
+                                        n = e;
+
+                                strcpy(n, ".roothash");
+
+                                r = read_one_line_file(fn, &text);
+                                if (r < 0 && r != -ENOENT)
+                                        return r;
+                        }
+                }
+
+                if (text) {
+                        r = unhexmem(text, strlen(text), &roothash_decoded, &roothash_decoded_size);
+                        if (r < 0)
+                                return r;
+                        if (roothash_decoded_size < sizeof(sd_id128_t))
+                                return -EINVAL;
+                }
+        }
+
+        if (ret_roothash) {
+                *ret_roothash = TAKE_PTR(roothash_decoded);
+                *ret_roothash_size = roothash_decoded_size;
+        }
+        if (ret_verity_data)
+                *ret_verity_data = TAKE_PTR(verity_filename);
+        if (roothashsig_filename)
+                *ret_roothashsig = TAKE_PTR(roothashsig_filename);
 
         return 1;
 }
@@ -1478,12 +1787,14 @@ int dissected_image_acquire_metadata(DissectedImage *m) {
         };
 
         _cleanup_strv_free_ char **machine_info = NULL, **os_release = NULL;
+        _cleanup_close_pair_ int error_pipe[2] = { -1, -1 };
         _cleanup_(rmdir_and_freep) char *t = NULL;
         _cleanup_(sigkill_waitp) pid_t child = 0;
         sd_id128_t machine_id = SD_ID128_NULL;
         _cleanup_free_ char *hostname = NULL;
         unsigned n_meta_initialized = 0, k;
-        int fds[2 * _META_MAX], r;
+        int fds[2 * _META_MAX], r, v;
+        ssize_t n;
 
         BLOCK_SIGNALS(SIGCHLD);
 
@@ -1499,18 +1810,28 @@ int dissected_image_acquire_metadata(DissectedImage *m) {
         if (r < 0)
                 goto finish;
 
+        if (pipe2(error_pipe, O_CLOEXEC) < 0) {
+                r = -errno;
+                goto finish;
+        }
+
         r = safe_fork("(sd-dissect)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_NEW_MOUNTNS|FORK_MOUNTNS_SLAVE, &child);
         if (r < 0)
                 goto finish;
         if (r == 0) {
+                error_pipe[0] = safe_close(error_pipe[0]);
+
                 r = dissected_image_mount(m, t, UID_INVALID, DISSECT_IMAGE_READ_ONLY|DISSECT_IMAGE_MOUNT_ROOT_ONLY|DISSECT_IMAGE_VALIDATE_OS);
                 if (r < 0) {
+                        /* Let parent know the error */
+                        (void) write(error_pipe[1], &r, sizeof(r));
+
                         log_debug_errno(r, "Failed to mount dissected image: %m");
                         _exit(EXIT_FAILURE);
                 }
 
                 for (k = 0; k < _META_MAX; k++) {
-                        _cleanup_close_ int fd = -1;
+                        _cleanup_close_ int fd = -ENOENT;
                         const char *p;
 
                         fds[2*k] = safe_close(fds[2*k]);
@@ -1522,12 +1843,15 @@ int dissected_image_acquire_metadata(DissectedImage *m) {
                         }
                         if (fd < 0) {
                                 log_debug_errno(fd, "Failed to read %s file of image, ignoring: %m", paths[k]);
+                                fds[2*k+1] = safe_close(fds[2*k+1]);
                                 continue;
                         }
 
                         r = copy_bytes(fd, fds[2*k+1], (uint64_t) -1, 0);
-                        if (r < 0)
+                        if (r < 0) {
+                                (void) write(error_pipe[1], &r, sizeof(r));
                                 _exit(EXIT_FAILURE);
+                        }
 
                         fds[2*k+1] = safe_close(fds[2*k+1]);
                 }
@@ -1535,18 +1859,18 @@ int dissected_image_acquire_metadata(DissectedImage *m) {
                 _exit(EXIT_SUCCESS);
         }
 
+        error_pipe[1] = safe_close(error_pipe[1]);
+
         for (k = 0; k < _META_MAX; k++) {
                 _cleanup_fclose_ FILE *f = NULL;
 
                 fds[2*k+1] = safe_close(fds[2*k+1]);
 
-                f = fdopen(fds[2*k], "r");
+                f = take_fdopen(&fds[2*k], "r");
                 if (!f) {
                         r = -errno;
                         goto finish;
                 }
-
-                fds[2*k] = -1;
 
                 switch (k) {
 
@@ -1594,7 +1918,16 @@ int dissected_image_acquire_metadata(DissectedImage *m) {
         r = wait_for_terminate_and_check("(sd-dissect)", child, 0);
         child = 0;
         if (r < 0)
-                goto finish;
+                return r;
+
+        n = read(error_pipe[0], &v, sizeof(v));
+        if (n < 0)
+                return -errno;
+        if (n == sizeof(v))
+                return v; /* propagate error sent to us from child */
+        if (n != 0)
+                return -EIO;
+
         if (r != EXIT_SUCCESS)
                 return -EPROTO;
 
@@ -1615,6 +1948,8 @@ int dissect_image_and_warn(
                 const char *name,
                 const void *root_hash,
                 size_t root_hash_size,
+                const char *verity_data,
+                const MountOptions *mount_options,
                 DissectImageFlags flags,
                 DissectedImage **ret) {
 
@@ -1629,7 +1964,7 @@ int dissect_image_and_warn(
                 name = buffer;
         }
 
-        r = dissect_image(fd, root_hash, root_hash_size, flags, ret);
+        r = dissect_image(fd, root_hash, root_hash_size, verity_data, mount_options, flags, ret);
 
         switch (r) {
 
@@ -1657,6 +1992,117 @@ int dissect_image_and_warn(
 
                 return r;
         }
+}
+
+bool dissected_image_can_do_verity(const DissectedImage *image, unsigned partition_designator) {
+        if (image->single_file_system)
+                return partition_designator == PARTITION_ROOT && image->can_verity;
+
+        return PARTITION_VERITY_OF(partition_designator) >= 0;
+}
+
+bool dissected_image_has_verity(const DissectedImage *image, unsigned partition_designator) {
+        int k;
+
+        if (image->single_file_system)
+                return partition_designator == PARTITION_ROOT && image->verity;
+
+        k = PARTITION_VERITY_OF(partition_designator);
+        return k >= 0 && image->partitions[k].found;
+}
+
+MountOptions* mount_options_free_all(MountOptions *options) {
+        MountOptions *m;
+
+        while ((m = options)) {
+                LIST_REMOVE(mount_options, options, m);
+                free(m->options);
+                free(m);
+        }
+
+        return NULL;
+}
+
+const char* mount_options_from_part(const MountOptions *options, unsigned int partition_number) {
+        MountOptions *m;
+
+        LIST_FOREACH(mount_options, m, (MountOptions *)options)
+                if (partition_number == m->partition_number && !isempty(m->options))
+                        return m->options;
+
+        return NULL;
+}
+
+int mount_image_privately_interactively(
+                const char *image,
+                DissectImageFlags flags,
+                char **ret_directory,
+                LoopDevice **ret_loop_device,
+                DecryptedImage **ret_decrypted_image) {
+
+        _cleanup_(loop_device_unrefp) LoopDevice *d = NULL;
+        _cleanup_(decrypted_image_unrefp) DecryptedImage *decrypted_image = NULL;
+        _cleanup_(dissected_image_unrefp) DissectedImage *dissected_image = NULL;
+        _cleanup_(rmdir_and_freep) char *created_dir = NULL;
+        _cleanup_free_ char *temp = NULL;
+        int r;
+
+        /* Mounts an OS image at a temporary place, inside a newly created mount namespace of our own. This
+         * is used by tools such as systemd-tmpfiles or systemd-firstboot to operate on some disk image
+         * easily. */
+
+        assert(image);
+        assert(ret_directory);
+        assert(ret_loop_device);
+        assert(ret_decrypted_image);
+
+        r = tempfn_random_child(NULL, program_invocation_short_name, &temp);
+        if (r < 0)
+                return log_error_errno(r, "Failed to generate temporary mount directory: %m");
+
+        r = loop_device_make_by_path(
+                        image,
+                        FLAGS_SET(flags, DISSECT_IMAGE_READ_ONLY) ? O_RDONLY : O_RDWR,
+                        FLAGS_SET(flags, DISSECT_IMAGE_NO_PARTITION_TABLE) ? 0 : LO_FLAGS_PARTSCAN,
+                        &d);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set up loopback device: %m");
+
+        r = dissect_image_and_warn(d->fd, image, NULL, 0, NULL, NULL, flags, &dissected_image);
+        if (r < 0)
+                return r;
+
+        r = dissected_image_decrypt_interactively(dissected_image, NULL, NULL, 0, NULL, NULL, NULL, 0, flags, &decrypted_image);
+        if (r < 0)
+                return r;
+
+        r = detach_mount_namespace();
+        if (r < 0)
+                return log_error_errno(r, "Failed to detach mount namespace: %m");
+
+        r = mkdir_p(temp, 0700);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create mount point: %m");
+
+        created_dir = TAKE_PTR(temp);
+
+        r = dissected_image_mount_and_warn(dissected_image, created_dir, UID_INVALID, flags);
+        if (r < 0)
+                return r;
+
+        if (decrypted_image) {
+                r = decrypted_image_relinquish(decrypted_image);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to relinquish DM devices: %m");
+        }
+
+        loop_device_relinquish(d);
+
+        *ret_directory = TAKE_PTR(created_dir);
+        *ret_loop_device = TAKE_PTR(d);
+        *ret_decrypted_image = TAKE_PTR(decrypted_image);
+
+        return 0;
 }
 
 static const char *const partition_designator_table[] = {

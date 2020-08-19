@@ -263,6 +263,10 @@ int job_install_deserialized(Job *j) {
                 return log_unit_debug_errno(j->unit, SYNTHETIC_ERRNO(EEXIST),
                                             "Unit already has a job installed. Not installing deserialized job.");
 
+        r = hashmap_ensure_allocated(&j->manager->jobs, NULL);
+        if (r < 0)
+                return r;
+
         r = hashmap_put(j->manager->jobs, UINT32_TO_PTR(j->id), j);
         if (r == -EEXIST)
                 return log_unit_debug_errno(j->unit, r, "Job ID %" PRIu32 " already used, cannot deserialize job.", j->id);
@@ -383,62 +387,25 @@ JobType job_type_lookup_merge(JobType a, JobType b) {
         return job_merging_table[(a - 1) * a / 2 + b];
 }
 
-bool job_later_link_matters(Job *j, JobType type, unsigned generation) {
-        JobDependency *l;
-
-        assert(j);
-
-        j->generation = generation;
-
-        LIST_FOREACH(subject, l, j->subject_list) {
-                UnitActiveState state = _UNIT_ACTIVE_STATE_INVALID;
-
-                /* Have we seen this before? */
-                if (l->object->generation == generation)
-                        continue;
-
-                state = unit_active_state(l->object->unit);
-                switch (type) {
-
-                case JOB_START:
-                        return IN_SET(state, UNIT_INACTIVE, UNIT_FAILED) ||
-                               job_later_link_matters(l->object, type, generation);
-
-                case JOB_STOP:
-                        return IN_SET(state, UNIT_ACTIVE, UNIT_RELOADING) ||
-                               job_later_link_matters(l->object, type, generation);
-
-                default:
-                        assert_not_reached("Invalid job type");
-                }
-        }
-
-        return false;
-}
-
-bool job_is_redundant(Job *j, unsigned generation) {
-
-        assert(j);
-
-        UnitActiveState state = unit_active_state(j->unit);
-        switch (j->type) {
+bool job_type_is_redundant(JobType a, UnitActiveState b) {
+        switch (a) {
 
         case JOB_START:
-                return IN_SET(state, UNIT_ACTIVE, UNIT_RELOADING) && !job_later_link_matters(j, JOB_START, generation);
+                return IN_SET(b, UNIT_ACTIVE, UNIT_RELOADING);
 
         case JOB_STOP:
-                return IN_SET(state, UNIT_INACTIVE, UNIT_FAILED) && !job_later_link_matters(j, JOB_STOP, generation);
+                return IN_SET(b, UNIT_INACTIVE, UNIT_FAILED);
 
         case JOB_VERIFY_ACTIVE:
-                return IN_SET(state, UNIT_ACTIVE, UNIT_RELOADING);
+                return IN_SET(b, UNIT_ACTIVE, UNIT_RELOADING);
 
         case JOB_RELOAD:
                 return
-                        state == UNIT_RELOADING;
+                        b == UNIT_RELOADING;
 
         case JOB_RESTART:
                 return
-                        state == UNIT_ACTIVATING;
+                        b == UNIT_ACTIVATING;
 
         case JOB_NOP:
                 return true;
@@ -516,12 +483,20 @@ static bool job_is_runnable(Job *j) {
                 return true;
 
         HASHMAP_FOREACH_KEY(v, other, j->unit->dependencies[UNIT_AFTER], i)
-                if (other->job && job_compare(j, other->job, UNIT_AFTER) > 0)
+                if (other->job && job_compare(j, other->job, UNIT_AFTER) > 0) {
+                        log_unit_debug(j->unit,
+                                       "starting held back, waiting for: %s",
+                                       other->id);
                         return false;
+                }
 
         HASHMAP_FOREACH_KEY(v, other, j->unit->dependencies[UNIT_BEFORE], i)
-                if (other->job && job_compare(j, other->job, UNIT_BEFORE) > 0)
+                if (other->job && job_compare(j, other->job, UNIT_BEFORE) > 0) {
+                        log_unit_debug(j->unit,
+                                       "stopping held back, waiting for: %s",
+                                       other->id);
                         return false;
+                }
 
         return true;
 }
@@ -572,7 +547,7 @@ static void job_print_begin_status_message(Unit *u, JobType t) {
         format = job_get_begin_status_message_format(u, t);
 
         DISABLE_WARNING_FORMAT_NONLITERAL;
-        unit_status_printf(u, "", format);
+        unit_status_printf(u, STATUS_TYPE_NORMAL, "", format);
         REENABLE_WARNING;
 }
 
@@ -797,9 +772,15 @@ _pure_ static const char *job_get_done_status_message_format(Unit *u, JobType t,
         assert(t < _JOB_TYPE_MAX);
 
         if (IN_SET(t, JOB_START, JOB_STOP, JOB_RESTART)) {
+                const UnitStatusMessageFormats *formats = &UNIT_VTABLE(u)->status_message_formats;
+                if (formats->finished_job) {
+                        format = formats->finished_job(u, t, result);
+                        if (format)
+                                return format;
+                }
                 format = t == JOB_START ?
-                        UNIT_VTABLE(u)->status_message_formats.finished_start_job[result] :
-                        UNIT_VTABLE(u)->status_message_formats.finished_stop_job[result];
+                        formats->finished_start_job[result] :
+                        formats->finished_stop_job[result];
                 if (format)
                         return format;
         }
@@ -861,11 +842,10 @@ static void job_print_done_status_message(Unit *u, JobType t, JobResult result) 
         else
                 status = job_print_done_status_messages[result].word;
 
-        if (result != JOB_DONE)
-                manager_flip_auto_status(u->manager, true);
-
         DISABLE_WARNING_FORMAT_NONLITERAL;
-        unit_status_printf(u, status, format);
+        unit_status_printf(u,
+                           result == JOB_DONE ? STATUS_TYPE_NORMAL : STATUS_TYPE_NOTICE,
+                           status, format);
         REENABLE_WARNING;
 
         if (t == JOB_START && result == JOB_FAILED) {
@@ -1010,9 +990,10 @@ int job_finish_and_invalidate(Job *j, JobResult result, bool recursive, bool alr
 
         j->result = result;
 
-        log_unit_debug(u, "Job %" PRIu32 " %s/%s finished, result=%s", j->id, u->id, job_type_to_string(t), job_result_to_string(result));
+        log_unit_debug(u, "Job %" PRIu32 " %s/%s finished, result=%s",
+                       j->id, u->id, job_type_to_string(t), job_result_to_string(result));
 
-        /* If this job did nothing to respective unit we don't log the status message */
+        /* If this job did nothing to the respective unit we don't log the status message */
         if (!already)
                 job_emit_done_status_message(u, j->id, t, result);
 
@@ -1049,7 +1030,7 @@ int job_finish_and_invalidate(Job *j, JobResult result, bool recursive, bool alr
          * aren't active. This is when the verify-active job merges with a
          * satisfying job type, and then loses it's invalidation effect, as the
          * result there is JOB_DONE for the start job we merged into, while we
-         * should be failing the depending job if the said unit isn't infact
+         * should be failing the depending job if the said unit isn't in fact
          * active. Oneshots are an example of this, where going directly from
          * activating to inactive is success.
          *

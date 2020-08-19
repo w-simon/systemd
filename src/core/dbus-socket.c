@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "alloc-util.h"
-#include "bus-util.h"
+#include "bus-get-properties.h"
 #include "dbus-cgroup.h"
 #include "dbus-execute.h"
 #include "dbus-kill.h"
@@ -104,6 +104,7 @@ const sd_bus_vtable bus_socket_vtable[] = {
         SD_BUS_PROPERTY("Broadcast", "b", bus_property_get_bool, offsetof(Socket, broadcast), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("PassCredentials", "b", bus_property_get_bool, offsetof(Socket, pass_cred), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("PassSecurity", "b", bus_property_get_bool, offsetof(Socket, pass_sec), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("PassPacketInfo", "b", bus_property_get_bool, offsetof(Socket, pass_pktinfo), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RemoveOnStop", "b", bus_property_get_bool, offsetof(Socket, remove_on_stop), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Listen", "a(ss)", property_get_listen, 0, SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Symlinks", "as", NULL, offsetof(Socket, symlinks), SD_BUS_VTABLE_PROPERTY_CONST),
@@ -202,6 +203,9 @@ static int bus_socket_set_transient_property(
         if (streq(name, "PassSecurity"))
                 return bus_set_transient_bool(u, name, &s->pass_sec, message, flags, error);
 
+        if (streq(name, "PassPacketInfo"))
+                return bus_set_transient_bool(u, name, &s->pass_pktinfo, message, flags, error);
+
         if (streq(name, "ReusePort"))
                 return bus_set_transient_bool(u, name, &s->reuse_port, message, flags, error);
 
@@ -278,10 +282,10 @@ static int bus_socket_set_transient_property(
                 return bus_set_transient_fdname(u, name, &s->fdname, message, flags, error);
 
         if (streq(name, "SocketUser"))
-                return bus_set_transient_user_compat(u, name, &s->user, message, flags, error);
+                return bus_set_transient_user_relaxed(u, name, &s->user, message, flags, error);
 
         if (streq(name, "SocketGroup"))
-                return bus_set_transient_user_compat(u, name, &s->group, message, flags, error);
+                return bus_set_transient_user_relaxed(u, name, &s->group, message, flags, error);
 
         if (streq(name, "BindIPv6Only"))
                 return bus_set_transient_bind_ipv6_only(u, name, &s->bind_ipv6_only, message, flags, error);

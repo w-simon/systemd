@@ -272,7 +272,7 @@ int path_is_mount_point(const char *t, const char *root, int flags) {
 
         fd = open_parent(t, O_PATH|O_CLOEXEC, 0);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return fd_is_mount_point(fd, last_path_component(t), flags);
 }
@@ -310,7 +310,8 @@ bool fstype_is_network(const char *fstype) {
                           "glusterfs",
                           "pvfs2", /* OrangeFS */
                           "ocfs2",
-                          "lustre");
+                          "lustre",
+                          "davfs");
 }
 
 bool fstype_is_api_vfs(const char *fstype) {
@@ -335,6 +336,16 @@ bool fstype_is_api_vfs(const char *fstype) {
                           "sysfs",
                           "tmpfs",
                           "tracefs");
+}
+
+bool fstype_is_blockdev_backed(const char *fstype) {
+        const char *x;
+
+        x = startswith(fstype, "fuse.");
+        if (x)
+                fstype = x;
+
+        return !streq(fstype, "9p") && !fstype_is_network(fstype) && !fstype_is_api_vfs(fstype);
 }
 
 bool fstype_is_ro(const char *fstype) {

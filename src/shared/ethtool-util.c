@@ -209,7 +209,7 @@ int ethtool_get_link_info(int *ethtool_fd, const char *ifname,
 
                 speed = ethtool_cmd_speed(&ecmd);
                 *ret_speed = speed == (uint32_t) SPEED_UNKNOWN ?
-                        SIZE_MAX : (size_t) speed * 1000 * 1000;
+                        UINT64_MAX : (uint64_t) speed * 1000 * 1000;
         }
 
         if (ret_duplex)
@@ -256,8 +256,13 @@ int ethtool_get_permanent_macaddr(int *ethtool_fd, const char *ifname, struct et
         if (epaddr.addr.size != 6)
                 return -EOPNOTSUPP;
 
+#pragma GCC diagnostic push
+#if HAVE_ZERO_LENGTH_BOUNDS
+#  pragma GCC diagnostic ignored "-Wzero-length-bounds"
+#endif
         for (size_t i = 0; i < epaddr.addr.size; i++)
                 ret->ether_addr_octet[i] = epaddr.addr.data[i];
+#pragma GCC diagnostic pop
 
         return 0;
 }
@@ -431,18 +436,24 @@ int ethtool_set_nic_buffer_size(int *ethtool_fd, const char *ifname, netdev_ring
         if (r < 0)
                 return -errno;
 
-        if (ring->rx_pending_set) {
-                if (ecmd.rx_pending != ring->rx_pending) {
-                        ecmd.rx_pending = ring->rx_pending;
-                        need_update = true;
-                }
+        if (ring->rx_pending_set && ecmd.rx_pending != ring->rx_pending) {
+                ecmd.rx_pending = ring->rx_pending;
+                need_update = true;
         }
 
-        if (ring->tx_pending_set) {
-                   if (ecmd.tx_pending != ring->tx_pending) {
-                           ecmd.tx_pending = ring->tx_pending;
-                           need_update = true;
-                }
+        if (ring->rx_mini_pending_set && ecmd.rx_mini_pending != ring->rx_mini_pending) {
+                ecmd.rx_mini_pending = ring->rx_mini_pending;
+                need_update = true;
+        }
+
+        if (ring->rx_jumbo_pending_set && ecmd.rx_jumbo_pending != ring->rx_jumbo_pending) {
+                ecmd.rx_jumbo_pending = ring->rx_jumbo_pending;
+                need_update = true;
+        }
+
+        if (ring->tx_pending_set && ecmd.tx_pending != ring->tx_pending) {
+                ecmd.tx_pending = ring->tx_pending;
+                need_update = true;
         }
 
         if (need_update) {
@@ -479,7 +490,12 @@ static int get_stringset(int ethtool_fd, struct ifreq *ifr, int stringset_id, st
         if (!buffer.info.sset_mask)
                 return -EINVAL;
 
+#pragma GCC diagnostic push
+#if HAVE_ZERO_LENGTH_BOUNDS
+#  pragma GCC diagnostic ignored "-Wzero-length-bounds"
+#endif
         len = buffer.info.data[0];
+#pragma GCC diagnostic pop
 
         strings = malloc0(sizeof(struct ethtool_gstrings) + len * ETH_GSTRING_LEN);
         if (!strings)
@@ -851,6 +867,55 @@ int ethtool_set_channels(int *fd, const char *ifname, netdev_channels *channels)
         return 0;
 }
 
+int ethtool_set_flow_control(int *fd, const char *ifname, int rx, int tx, int autoneg) {
+        struct ethtool_pauseparam ecmd = {
+                .cmd = ETHTOOL_GPAUSEPARAM
+        };
+        struct ifreq ifr = {
+                .ifr_data = (void*) &ecmd
+        };
+
+        bool need_update = false;
+        int r;
+
+        if (*fd < 0) {
+                r = ethtool_connect_or_warn(fd, true);
+                if (r < 0)
+                        return r;
+        }
+
+        strscpy(ifr.ifr_name, IFNAMSIZ, ifname);
+
+        r = ioctl(*fd, SIOCETHTOOL, &ifr);
+        if (r < 0)
+                return -errno;
+
+        if (rx >= 0 && ecmd.rx_pause != (uint32_t) rx) {
+                ecmd.rx_pause = rx;
+                need_update = true;
+        }
+
+        if (tx >= 0 && ecmd.tx_pause != (uint32_t) tx) {
+                ecmd.tx_pause = tx;
+                need_update = true;
+        }
+
+        if (autoneg >= 0 && ecmd.autoneg != (uint32_t) autoneg) {
+                ecmd.autoneg = autoneg;
+                need_update = true;
+        }
+
+        if (need_update) {
+                ecmd.cmd = ETHTOOL_SPAUSEPARAM;
+
+                r = ioctl(*fd, SIOCETHTOOL, &ifr);
+                if (r < 0)
+                        return -errno;
+        }
+
+        return 0;
+}
+
 int config_parse_channel(const char *unit,
                          const char *filename,
                          unsigned line,
@@ -987,6 +1052,12 @@ int config_parse_nic_buffer_size(const char *unit,
         if (streq(lvalue, "RxBufferSize")) {
                 ring->rx_pending = k;
                 ring->rx_pending_set = true;
+        } else if (streq(lvalue, "RxMiniBufferSize")) {
+                ring->rx_mini_pending = k;
+                ring->rx_mini_pending_set = true;
+        } else if (streq(lvalue, "RxJumboBufferSize")) {
+                ring->rx_jumbo_pending = k;
+                ring->rx_jumbo_pending_set = true;
         } else if (streq(lvalue, "TxBufferSize")) {
                 ring->tx_pending = k;
                 ring->tx_pending_set = true;

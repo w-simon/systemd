@@ -9,6 +9,7 @@
 #include "condition.h"
 #include "emergency-action.h"
 #include "list.h"
+#include "show-status.h"
 #include "set.h"
 #include "unit-file.h"
 #include "cgroup.h"
@@ -113,10 +114,13 @@ typedef struct Unit {
         UnitLoadState load_state;
         Unit *merged_into;
 
-        char *id; /* One name is special because we use it for identification. Points to an entry in the names set */
+        FreezerState freezer_state;
+        sd_bus_message *pending_freezer_message;
+
+        char *id;   /* The one special name that we use for identification */
         char *instance;
 
-        Set *names;
+        Set *aliases; /* All the other names. */
 
         /* For each dependency type we maintain a Hashmap whose key is the Unit* object, and the value encodes why the
          * dependency exists, using the UnitDependencyInfo type */
@@ -132,6 +136,7 @@ typedef struct Unit {
         char *source_path; /* if converted, the source file */
         char **dropin_paths;
 
+        usec_t fragment_loadtime;
         usec_t fragment_mtime;
         usec_t source_mtime;
         usec_t dropin_mtime;
@@ -381,6 +386,9 @@ typedef struct UnitStatusMessageFormats {
         const char *starting_stopping[2];
         const char *finished_start_job[_JOB_RESULT_MAX];
         const char *finished_stop_job[_JOB_RESULT_MAX];
+        /* If this entry is present, it'll be called to provide a context-dependent format string,
+         * or NULL to fall back to finished_{start,stop}_job; if those are NULL too, fall back to generic. */
+        const char *(*finished_job)(Unit *u, JobType t, JobResult result);
 } UnitStatusMessageFormats;
 
 /* Flags used when writing drop-in files or transient unit files */
@@ -479,6 +487,11 @@ typedef struct UnitVTable {
         /* Clear out the various runtime/state/cache/logs/configuration data */
         int (*clean)(Unit *u, ExecCleanMask m);
 
+        /* Freeze the unit */
+        int (*freeze)(Unit *u);
+        int (*thaw)(Unit *u);
+        bool (*can_freeze)(Unit *u);
+
         /* Return which kind of data can be cleaned */
         int (*can_clean)(Unit *u, ExecCleanMask *ret);
 
@@ -527,7 +540,7 @@ typedef struct UnitVTable {
         void (*notify_cgroup_oom)(Unit *u);
 
         /* Called whenever a process of this unit sends us a message */
-        void (*notify_message)(Unit *u, const struct ucred *ucred, char **tags, FDSet *fds);
+        void (*notify_message)(Unit *u, const struct ucred *ucred, char * const *tags, FDSet *fds);
 
         /* Called whenever a name this Unit registered for comes or goes away. */
         void (*bus_name_owner_change)(Unit *u, const char *new_owner);
@@ -588,9 +601,6 @@ typedef struct UnitVTable {
          * of this type will immediately fail. */
         bool (*supported)(void);
 
-        /* The bus vtable */
-        const sd_bus_vtable *bus_vtable;
-
         /* The strings to print in status messages */
         UnitStatusMessageFormats status_message_formats;
 
@@ -605,9 +615,6 @@ typedef struct UnitVTable {
 
         /* True if the unit type knows a failure state, and thus can be source of an OnFailure= dependency */
         bool can_fail:1;
-
-        /* True if After= dependencies should be refused */
-        bool refuse_after:1;
 
         /* True if units of this type shall be startable only once and then never again */
         bool once_only:1;
@@ -691,6 +698,8 @@ const char *unit_status_string(Unit *u) _pure_;
 bool unit_has_name(const Unit *u, const char *name);
 
 UnitActiveState unit_active_state(Unit *u);
+FreezerState unit_freezer_state(Unit *u);
+int unit_freezer_state_kernel(Unit *u, FreezerState *ret);
 
 const char* unit_sub_state_to_string(Unit *u);
 
@@ -748,7 +757,7 @@ int unit_add_blockdev_dependency(Unit *u, const char *what, UnitDependencyMask m
 int unit_coldplug(Unit *u);
 void unit_catchup(Unit *u);
 
-void unit_status_printf(Unit *u, const char *status, const char *unit_status_msg_format) _printf_(3, 0);
+void unit_status_printf(Unit *u, StatusType status_type, const char *status, const char *unit_status_msg_format) _printf_(4, 0);
 
 bool unit_need_daemon_reload(Unit *u);
 
@@ -821,7 +830,6 @@ void unit_unref_uid_gid(Unit *u, bool destroy_now);
 
 void unit_notify_user_lookup(Unit *u, uid_t uid, gid_t gid);
 
-int unit_set_invocation_id(Unit *u, sd_id128_t id);
 int unit_acquire_invocation_id(Unit *u);
 
 bool unit_shall_confirm_spawn(Unit *u);
@@ -838,7 +846,9 @@ void unit_unlink_state_files(Unit *u);
 
 int unit_prepare_exec(Unit *u);
 
-int unit_warn_leftover_processes(Unit *u);
+int unit_log_leftover_process_start(pid_t pid, int sig, void *userdata);
+int unit_log_leftover_process_stop(pid_t pid, int sig, void *userdata);
+int unit_warn_leftover_processes(Unit *u, cg_kill_log_func_t log_func);
 
 bool unit_needs_console(Unit *u);
 
@@ -874,13 +884,24 @@ void unit_destroy_runtime_directory(Unit *u, const ExecContext *context);
 int unit_clean(Unit *u, ExecCleanMask mask);
 int unit_can_clean(Unit *u, ExecCleanMask *ret_mask);
 
+bool unit_can_freeze(Unit *u);
+int unit_freeze(Unit *u);
+void unit_frozen(Unit *u);
+
+int unit_thaw(Unit *u);
+void unit_thawed(Unit *u);
+
+int unit_freeze_vtable_common(Unit *u);
+int unit_thaw_vtable_common(Unit *u);
+
 /* Macros which append UNIT= or USER_UNIT= to the message */
 
 #define log_unit_full(unit, level, error, ...)                          \
         ({                                                              \
                 const Unit *_u = (unit);                                \
-                _u ? log_object_internal(level, error, PROJECT_FILE, __LINE__, __func__, _u->manager->unit_log_field, _u->id, _u->manager->invocation_log_field, _u->invocation_id_string, ##__VA_ARGS__) : \
-                        log_internal(level, error, PROJECT_FILE, __LINE__, __func__, ##__VA_ARGS__); \
+                (log_get_max_level() < LOG_PRI(level)) ? -ERRNO_VALUE(error) : \
+                        _u ? log_object_internal(level, error, PROJECT_FILE, __LINE__, __func__, _u->manager->unit_log_field, _u->id, _u->manager->invocation_log_field, _u->invocation_id_string, ##__VA_ARGS__) : \
+                                log_internal(level, error, PROJECT_FILE, __LINE__, __func__, ##__VA_ARGS__); \
         })
 
 #define log_unit_debug(unit, ...)   log_unit_full(unit, LOG_DEBUG, 0, ##__VA_ARGS__)

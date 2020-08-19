@@ -517,7 +517,7 @@ static int copy_file_with_version_check(const char *from, const char *to, bool f
         if (!force) {
                 fd_to = open(to, O_RDONLY|O_CLOEXEC|O_NOCTTY);
                 if (fd_to < 0) {
-                        if (errno != -ENOENT)
+                        if (errno != ENOENT)
                                 return log_error_errno(errno, "Failed to open \"%s\" for reading: %m", to);
                 } else {
                         r = version_check(fd_from, from, fd_to, to);
@@ -888,14 +888,6 @@ static int remove_subdirs(const char *root, const char *const *subdirs) {
         return r < 0 ? r : q;
 }
 
-static int remove_machine_id_directory(const char *root, sd_id128_t machine_id) {
-        char buf[SD_ID128_STRING_MAX];
-
-        assert(root);
-
-        return rmdir_one(root, sd_id128_to_string(machine_id, buf));
-}
-
 static int remove_binaries(const char *esp_path) {
         const char *p;
         int r, q;
@@ -978,12 +970,12 @@ static int remove_loader_variables(void) {
         return r;
 }
 
-static int install_loader_config(const char *esp_path, sd_id128_t machine_id) {
-        char machine_string[SD_ID128_STRING_MAX];
+static int install_loader_config(const char *esp_path) {
         _cleanup_(unlink_and_freep) char *t = NULL;
         _cleanup_fclose_ FILE *f = NULL;
+        _cleanup_close_ int fd = -1;
         const char *p;
-        int r, fd;
+        int r;
 
         p = prefix_roota(esp_path, "/loader/loader.conf");
         if (access(p, F_OK) >= 0) /* Silently skip creation if the file already exists (early check) */
@@ -993,21 +985,18 @@ static int install_loader_config(const char *esp_path, sd_id128_t machine_id) {
         if (fd < 0)
                 return log_error_errno(fd, "Failed to open \"%s\" for writing: %m", p);
 
-        f = fdopen(fd, "w");
-        if (!f) {
-                safe_close(fd);
+        f = take_fdopen(&fd, "w");
+        if (!f)
                 return log_oom();
-        }
 
         fprintf(f, "#timeout 3\n"
-                   "#console-mode keep\n"
-                   "default %s-*\n", sd_id128_to_string(machine_id, machine_string));
+                   "#console-mode keep\n");
 
         r = fflush_sync_and_check(f);
         if (r < 0)
                 return log_error_errno(r, "Failed to write \"%s\": %m", p);
 
-        r = link_tmpfile(fd, t, p);
+        r = link_tmpfile(fileno(f), t, p);
         if (r == -EEXIST)
                 return 0; /* Silently skip creation if the file exists now (recheck) */
         if (r < 0)
@@ -1015,14 +1004,6 @@ static int install_loader_config(const char *esp_path, sd_id128_t machine_id) {
 
         t = mfree(t);
         return 1;
-}
-
-static int install_machine_id_directory(const char *root, sd_id128_t machine_id) {
-        char buf[SD_ID128_STRING_MAX];
-
-        assert(root);
-
-        return mkdir_one(root, sd_id128_to_string(machine_id, buf));
 }
 
 static int help(int argc, char *argv[], void *userdata) {
@@ -1042,7 +1023,10 @@ static int help(int argc, char *argv[], void *userdata) {
                "  remove              Remove systemd-boot from the ESP and EFI variables\n"
                "  is-installed        Test whether systemd-boot is installed in the ESP\n"
                "  random-seed         Initialize random seed in ESP and EFI variables\n"
-               "  systemd-efi-options Query or set system options string in EFI variable\n"
+               "  systemd-efi-options [STRING]\n"
+               "                      Query or set system options string in EFI variable\n"
+               "  reboot-to-firmware [BOOL]\n"
+               "                      Query or set reboot-to-firmware EFI flag\n"
                "\nBoot Loader Entries Commands:\n"
                "  list                List boot loader entries\n"
                "  set-default ID      Set default boot loader entry\n"
@@ -1246,6 +1230,18 @@ static int verb_status(int argc, char *argv[], void *userdata) {
                 printf("     Firmware: %s%s (%s)%s\n", ansi_highlight(), strna(fw_type), strna(fw_info), ansi_normal());
                 printf("  Secure Boot: %sd\n", enable_disable(is_efi_secure_boot()));
                 printf("   Setup Mode: %s\n", is_efi_secure_boot_setup_mode() ? "setup" : "user");
+
+                r = efi_get_reboot_to_firmware();
+                if (r > 0)
+                        printf(" Boot into FW: %sactive%s\n", ansi_highlight_yellow(), ansi_normal());
+                else if (r == 0)
+                        printf(" Boot into FW: supported\n");
+                else if (r == -EOPNOTSUPP)
+                        printf(" Boot into FW: not supported\n");
+                else {
+                        errno = -r;
+                        printf(" Boot into FW: %sfailed%s (%m)\n", ansi_highlight_red(), ansi_normal());
+                }
                 printf("\n");
 
                 printf("Current Boot Loader:\n");
@@ -1312,6 +1308,7 @@ static int verb_status(int argc, char *argv[], void *userdata) {
 
 static int verb_list(int argc, char *argv[], void *userdata) {
         _cleanup_(boot_config_free) BootConfig config = {};
+        _cleanup_strv_free_ char **efi_entries = NULL;
         int r;
 
         /* If we lack privileges we invoke find_esp_and_warn() in "unprivileged mode" here, which does two things: turn
@@ -1334,7 +1331,13 @@ static int verb_list(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return r;
 
-        (void) boot_entries_augment_from_loader(&config, false);
+        r = efi_loader_get_entries(&efi_entries);
+        if (r == -ENOENT || ERRNO_IS_NOT_SUPPORTED(r))
+                log_debug_errno(r, "Boot loader reported no entries.");
+        else if (r < 0)
+                log_warning_errno(r, "Failed to determine entries reported by boot loader, ignoring: %m");
+        else
+                (void) boot_entries_augment_from_loader(&config, efi_entries, false);
 
         if (config.n_entries == 0)
                 log_info("No boot loader entries found.");
@@ -1436,7 +1439,7 @@ static int install_random_seed(const char *esp) {
                          * the EFI variable space we can make sure that even though the random seeds on disk
                          * are all the same they will be different on each system under the assumption that
                          * the EFI variable space is maintained separate from the random seed storage. That
-                         * is generally the case on physical systems, as the ESP is stored on persistant
+                         * is generally the case on physical systems, as the ESP is stored on persistent
                          * storage, and the EFI variables in NVRAM. However in virtualized environments this
                          * is generally not true: the EFI variable set is typically stored along with the
                          * disk image itself. For example, using the OVMF EFI firmware the EFI variables are
@@ -1510,7 +1513,6 @@ static int verb_install(int argc, char *argv[], void *userdata) {
         sd_id128_t uuid = SD_ID128_NULL;
         uint64_t pstart = 0, psize = 0;
         uint32_t part = 0;
-        sd_id128_t machine_id;
         bool install;
         int r;
 
@@ -1521,10 +1523,6 @@ static int verb_install(int argc, char *argv[], void *userdata) {
         r = acquire_xbootldr(false, NULL);
         if (r < 0)
                 return r;
-
-        r = sd_id128_get_machine(&machine_id);
-        if (r < 0)
-                return log_error_errno(r, "Failed to get machine id: %m");
 
         install = streq(argv[0], "install");
 
@@ -1547,11 +1545,7 @@ static int verb_install(int argc, char *argv[], void *userdata) {
                         return r;
 
                 if (install) {
-                        r = install_loader_config(arg_esp_path, machine_id);
-                        if (r < 0)
-                                return r;
-
-                        r = install_machine_id_directory(arg_dollar_boot_path(), machine_id);
+                        r = install_loader_config(arg_esp_path);
                         if (r < 0)
                                 return r;
 
@@ -1573,7 +1567,7 @@ static int verb_install(int argc, char *argv[], void *userdata) {
 }
 
 static int verb_remove(int argc, char *argv[], void *userdata) {
-        sd_id128_t uuid = SD_ID128_NULL, machine_id;
+        sd_id128_t uuid = SD_ID128_NULL;
         int r, q;
 
         r = acquire_esp(false, NULL, NULL, NULL, &uuid);
@@ -1583,10 +1577,6 @@ static int verb_remove(int argc, char *argv[], void *userdata) {
         r = acquire_xbootldr(false, NULL);
         if (r < 0)
                 return r;
-
-        r = sd_id128_get_machine(&machine_id);
-        if (r < 0)
-                return log_error_errno(r, "Failed to get machine id: %m");
 
         r = remove_binaries(arg_esp_path);
 
@@ -1606,17 +1596,9 @@ static int verb_remove(int argc, char *argv[], void *userdata) {
         if (q < 0 && r >= 0)
                 r = q;
 
-        q = remove_machine_id_directory(arg_esp_path, machine_id);
-        if (q < 0 && r >= 0)
-                r = 1;
-
         if (arg_xbootldr_path) {
                 /* Remove the latter two also in the XBOOTLDR partition if it exists */
                 q = remove_subdirs(arg_xbootldr_path, dollar_boot_subdirs);
-                if (q < 0 && r >= 0)
-                        r = q;
-
-                q = remove_machine_id_directory(arg_xbootldr_path, machine_id);
                 if (q < 0 && r >= 0)
                         r = q;
         }
@@ -1767,6 +1749,39 @@ static int verb_systemd_efi_options(int argc, char *argv[], void *userdata) {
         return 0;
 }
 
+static int verb_reboot_to_firmware(int argc, char *argv[], void *userdata) {
+        int r;
+
+        if (argc < 2) {
+                r = efi_get_reboot_to_firmware();
+                if (r > 0) {
+                        puts("active");
+                        return EXIT_SUCCESS; /* success */
+                }
+                if (r == 0) {
+                        puts("supported");
+                        return 1; /* recognizable error #1 */
+                }
+                if (r == -EOPNOTSUPP) {
+                        puts("not supported");
+                        return 2; /* recognizable error #2 */
+                }
+
+                log_error_errno(r, "Failed to query reboot-to-firmware state: %m");
+                return 3; /* other kind of error */
+        } else {
+                r = parse_boolean(argv[1]);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse argument: %s", argv[1]);
+
+                r = efi_set_reboot_to_firmware(r);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to set reboot-to-firmware option: %m");
+
+                return 0;
+        }
+}
+
 static int bootctl_main(int argc, char *argv[]) {
         static const Verb verbs[] = {
                 { "help",                VERB_ANY, VERB_ANY, 0,            help                     },
@@ -1780,6 +1795,7 @@ static int bootctl_main(int argc, char *argv[]) {
                 { "set-oneshot",         2,        2,        0,            verb_set_default         },
                 { "random-seed",         VERB_ANY, 1,        0,            verb_random_seed         },
                 { "systemd-efi-options", VERB_ANY, 2,        0,            verb_systemd_efi_options },
+                { "reboot-to-firmware",  VERB_ANY, 2,        0,            verb_reboot_to_firmware  },
                 {}
         };
 
@@ -1803,4 +1819,4 @@ static int run(int argc, char *argv[]) {
         return bootctl_main(argc, argv);
 }
 
-DEFINE_MAIN_FUNCTION(run);
+DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);

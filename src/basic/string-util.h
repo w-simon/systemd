@@ -27,6 +27,7 @@
 #define strncaseeq(a, b, n) (strncasecmp((a), (b), (n)) == 0)
 
 int strcmp_ptr(const char *a, const char *b) _pure_;
+int strcasecmp_ptr(const char *a, const char *b) _pure_;
 
 static inline bool streq_ptr(const char *a, const char *b) {
         return strcmp_ptr(a, b) == 0;
@@ -112,8 +113,10 @@ typedef enum SplitFlags {
         SPLIT_RELAX                      = 0x01 << 1,
 } SplitFlags;
 
+/* Smelly. Do not use this anymore. Use extract_first_word() instead! */
 const char* split(const char **state, size_t *l, const char *separator, SplitFlags flags);
 
+/* Similar, don't use this anymore */
 #define FOREACH_WORD(word, length, s, state)                            \
         _FOREACH_WORD(word, length, s, WHITESPACE, 0, state)
 
@@ -132,8 +135,8 @@ char *strjoin_real(const char *x, ...) _sentinel_;
         ({                                                              \
                 const char *_appendees_[] = { a, __VA_ARGS__ };         \
                 char *_d_, *_p_;                                        \
-                size_t _len_ = 0;                                          \
-                size_t _i_;                                           \
+                size_t _len_ = 0;                                       \
+                size_t _i_;                                             \
                 for (_i_ = 0; _i_ < ELEMENTSOF(_appendees_) && _appendees_[_i_]; _i_++) \
                         _len_ += strlen(_appendees_[_i_]);              \
                 _p_ = _d_ = newa(char, _len_ + 1);                      \
@@ -149,7 +152,6 @@ char *delete_trailing_chars(char *s, const char *bad);
 char *truncate_nl(char *s);
 
 static inline char *skip_leading_chars(const char *s, const char *bad) {
-
         if (!s)
                 return NULL;
 
@@ -228,11 +230,9 @@ REENABLE_WARNING;
 
 /* Like startswith(), but operates on arbitrary memory blocks */
 static inline void *memory_startswith(const void *p, size_t sz, const char *token) {
-        size_t n;
-
         assert(token);
 
-        n = strlen(token);
+        size_t n = strlen(token);
         if (sz < n)
                 return NULL;
 
@@ -248,20 +248,17 @@ static inline void *memory_startswith(const void *p, size_t sz, const char *toke
  * It works only for ASCII strings.
  */
 static inline void *memory_startswith_no_case(const void *p, size_t sz, const char *token) {
-        size_t n, i;
-
         assert(token);
 
-        n = strlen(token);
+        size_t n = strlen(token);
         if (sz < n)
                 return NULL;
 
         assert(p);
 
-        for (i = 0; i < n; i++) {
+        for (size_t i = 0; i < n; i++)
                 if (ascii_tolower(((char *)p)[i]) != ascii_tolower(token[i]))
                         return NULL;
-        }
 
         return (uint8_t*) p + n;
 }

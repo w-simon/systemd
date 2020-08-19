@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # -*- mode: shell-script; indent-tabs-mode: nil; sh-basic-offset: 4; -*-
 # ex: ts=8 sw=4 sts=4 et filetype=sh
 
@@ -18,8 +18,9 @@ fi
 
 MACHINE_ID=$KERNEL_INSTALL_MACHINE_ID
 
-ENTRY_DIR="/$MACHINE_ID/$KERNEL_VERSION"
-BOOT_ROOT=${ENTRY_DIR_ABS%$ENTRY_DIR}
+BOOT_ROOT=${ENTRY_DIR_ABS%/$MACHINE_ID/$KERNEL_VERSION}
+BOOT_MNT=$(stat -c %m $BOOT_ROOT)
+ENTRY_DIR=/${ENTRY_DIR_ABS#$BOOT_MNT}
 
 if [[ $COMMAND == remove ]]; then
     rm -f "$BOOT_ROOT/loader/entries/$MACHINE_ID-$KERNEL_VERSION.conf"
@@ -55,6 +56,7 @@ else
     read -r -d '' -a line < /proc/cmdline
     for i in "${line[@]}"; do
         [[ "${i#initrd=*}" != "$i" ]] && continue
+        [[ "${i#BOOT_IMAGE=*}" != "$i" ]] && continue
         BOOT_OPTIONS+=("$i")
     done
 fi

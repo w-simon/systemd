@@ -3,6 +3,8 @@
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 
 #define __STDC_WANT_IEC_60559_TYPES_EXT__
 #include <float.h>
@@ -12,7 +14,7 @@
 /* Print information about various types. Useful when diagnosing
  * gcc diagnostics on an unfamiliar architecture. */
 
-#pragma GCC diagnostic ignored "-Wtype-limits"
+DISABLE_WARNING_TYPE_LIMITS;
 
 #define info(t)                                                         \
         printf("%s → %zu bits%s, %zu byte alignment\n", STRINGIFY(t),   \
@@ -65,6 +67,7 @@ int main(void) {
         info(pid_t);
         info(uid_t);
         info(gid_t);
+        info(socklen_t);
 
         info(__cpu_mask);
 

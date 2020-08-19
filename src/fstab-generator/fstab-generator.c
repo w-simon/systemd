@@ -35,11 +35,13 @@ typedef enum MountpointFlags {
         AUTOMOUNT = 1 << 2,
         MAKEFS    = 1 << 3,
         GROWFS    = 1 << 4,
+        RWONLY    = 1 << 5,
 } MountpointFlags;
 
 static const char *arg_dest = NULL;
 static const char *arg_dest_late = NULL;
 static bool arg_fstab_enabled = true;
+static bool arg_swap_enabled = true;
 static char *arg_root_what = NULL;
 static char *arg_root_fstype = NULL;
 static char *arg_root_options = NULL;
@@ -97,6 +99,11 @@ static int add_swap(
 
         assert(what);
         assert(me);
+
+        if (!arg_swap_enabled) {
+                log_info("Swap unit generation disabled on kernel command line, ignoring fstab swap entry for %s.", what);
+                return 0;
+        }
 
         if (access("/proc/swaps", F_OK) < 0) {
                 log_info("Swap not supported, ignoring fstab swap entry for %s.", what);
@@ -256,10 +263,10 @@ static int write_dependency(
                 res = strv_join(units, " ");
                 if (!res)
                         return log_oom();
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+
+                DISABLE_WARNING_FORMAT_NONLITERAL;
                 fprintf(f, format, res);
-#pragma GCC diagnostic pop
+                REENABLE_WARNING;
         }
 
         return 0;
@@ -303,6 +310,29 @@ static int write_requires_mounts_for(FILE *f, const char *opts) {
                 return log_oom();
 
         fprintf(f, "RequiresMountsFor=%s\n", res);
+
+        return 0;
+}
+
+static int write_extra_dependencies(FILE *f, const char *opts) {
+        int r;
+
+        assert(f);
+
+        if (opts) {
+                r = write_after(f, opts);
+                if (r < 0)
+                        return r;
+                r = write_requires_after(f, opts);
+                if (r < 0)
+                        return r;
+                r = write_before(f, opts);
+                if (r < 0)
+                        return r;
+                r = write_requires_mounts_for(f, opts);
+                if (r < 0)
+                        return r;
+        }
 
         return 0;
 }
@@ -385,12 +415,6 @@ static int add_mount(
                 "SourcePath=%s\n",
                 source);
 
-        /* All mounts under /sysroot need to happen later, at initrd-fs.target time. IOW, it's not
-         * technically part of the basic initrd filesystem itself, and so shouldn't inherit the default
-         * Before=local-fs.target dependency. */
-        if (in_initrd() && path_startswith(where, "/sysroot"))
-                fprintf(f, "DefaultDependencies=no\n");
-
         if (STRPTR_IN_SET(fstype, "nfs", "nfs4") && !(flags & AUTOMOUNT) &&
             fstab_test_yes_no_option(opts, "bg\0" "fg\0")) {
                 /* The default retry timeout that mount.nfs uses for 'bg' mounts
@@ -405,23 +429,9 @@ static int add_mount(
                 SET_FLAG(flags, NOFAIL, true);
         }
 
-        if (!(flags & NOFAIL) && !(flags & AUTOMOUNT))
-                fprintf(f, "Before=%s\n", post);
-
-        if (!(flags & AUTOMOUNT) && opts) {
-                 r = write_after(f, opts);
-                 if (r < 0)
-                         return r;
-                 r = write_requires_after(f, opts);
-                 if (r < 0)
-                         return r;
-                 r = write_before(f, opts);
-                 if (r < 0)
-                         return r;
-                 r = write_requires_mounts_for(f, opts);
-                 if (r < 0)
-                         return r;
-        }
+        r = write_extra_dependencies(f, opts);
+        if (r < 0)
+                return r;
 
         if (passno != 0) {
                 r = generator_write_fsck_deps(f, dest, what, where, fstype);
@@ -474,6 +484,9 @@ static int add_mount(
         r = write_options(f, filtered);
         if (r < 0)
                 return r;
+
+        if (flags & RWONLY)
+                fprintf(f, "ReadWriteOnly=yes\n");
 
         r = fflush_and_check(f);
         if (r < 0)
@@ -529,23 +542,6 @@ static int add_mount(
                         "Documentation=man:fstab(5) man:systemd-fstab-generator(8)\n",
                         source);
 
-                fprintf(f, "Before=%s\n", post);
-
-                if (opts) {
-                        r = write_after(f, opts);
-                        if (r < 0)
-                                return r;
-                        r = write_requires_after(f, opts);
-                        if (r < 0)
-                                return r;
-                        r = write_before(f, opts);
-                        if (r < 0)
-                                return r;
-                        r = write_requires_mounts_for(f, opts);
-                        if (r < 0)
-                                return r;
-                }
-
                 fprintf(f,
                         "\n"
                         "[Automount]\n"
@@ -588,7 +584,7 @@ static int parse_fstab(bool initrd) {
 
         while ((me = getmntent(f))) {
                 _cleanup_free_ char *where = NULL, *what = NULL, *canonical_where = NULL;
-                bool makefs, growfs, noauto, nofail;
+                bool makefs, growfs, noauto, nofail, rwonly;
                 int k;
 
                 if (initrd && !mount_in_initrd(me))
@@ -628,6 +624,7 @@ static int parse_fstab(bool initrd) {
 
                 makefs = fstab_test_option(me->mnt_opts, "x-systemd.makefs\0");
                 growfs = fstab_test_option(me->mnt_opts, "x-systemd.growfs\0");
+                rwonly = fstab_test_option(me->mnt_opts, "x-systemd.rw-only\0");
                 noauto = fstab_test_yes_no_option(me->mnt_opts, "noauto\0" "auto\0");
                 nofail = fstab_test_yes_no_option(me->mnt_opts, "nofail\0" "fail\0");
 
@@ -660,7 +657,7 @@ static int parse_fstab(bool initrd) {
                                       me->mnt_type,
                                       me->mnt_opts,
                                       me->mnt_passno,
-                                      makefs*MAKEFS | growfs*GROWFS | noauto*NOAUTO | nofail*NOFAIL | automount*AUTOMOUNT,
+                                      makefs*MAKEFS | growfs*GROWFS | noauto*NOAUTO | nofail*NOFAIL | automount*AUTOMOUNT | rwonly*RWONLY,
                                       post,
                                       fstab);
                 }
@@ -803,7 +800,7 @@ static int add_volatile_var(void) {
                          "/var",
                          NULL,
                          "tmpfs",
-                         "mode=0755",
+                         "mode=0755" TMPFS_LIMITS_VAR,
                          0,
                          0,
                          SPECIAL_LOCAL_FS_TARGET,
@@ -896,6 +893,14 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
                                 arg_volatile_mode = m;
                 } else
                         arg_volatile_mode = VOLATILE_YES;
+
+        } else if (streq(key, "systemd.swap")) {
+
+                r = value ? parse_boolean(value) : 1;
+                if (r < 0)
+                        log_warning("Failed to parse systemd.swap switch %s. Ignoring.", value);
+                else
+                        arg_swap_enabled = r;
         }
 
         return 0;

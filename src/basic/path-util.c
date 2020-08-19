@@ -640,10 +640,8 @@ int find_binary(const char *name, char **ret) {
                 if (access(j, X_OK) >= 0) {
                         /* Found it! */
 
-                        if (ret) {
-                                *ret = path_simplify(j, false);
-                                j = NULL;
-                        }
+                        if (ret)
+                                *ret = path_simplify(TAKE_PTR(j), false);
 
                         return 0;
                 }
@@ -1051,7 +1049,7 @@ int systemd_installation_has_version(const char *root, unsigned minimal_version)
                 if (!path)
                         return -ENOMEM;
 
-                r = glob_extend(&names, path);
+                r = glob_extend(&names, path, 0);
                 if (r == -ENOENT)
                         continue;
                 if (r < 0)
@@ -1122,6 +1120,22 @@ bool path_strv_contains(char **l, const char *path) {
         STRV_FOREACH(i, l)
                 if (path_equal(*i, path))
                         return true;
+
+        return false;
+}
+
+bool prefixed_path_strv_contains(char **l, const char *path) {
+        char **i, *j;
+
+        STRV_FOREACH(i, l) {
+                j = *i;
+                if (*j == '-')
+                        j++;
+                if (*j == '+')
+                        j++;
+                if (path_equal(j, path))
+                        return true;
+        }
 
         return false;
 }

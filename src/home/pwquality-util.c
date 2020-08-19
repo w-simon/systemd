@@ -73,7 +73,7 @@ int quality_check_password(
 
         r = pwquality_read_config(pwq, NULL, &auxerror);
         if (r < 0)
-                log_warning_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to read libpwquality configuation, ignoring: %s",
+                log_warning_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to read libpwquality configuration, ignoring: %s",
                                   pwquality_strerror(buf, sizeof(buf), r, auxerror));
 
         pwquality_maybe_disable_dictionary(pwq);
@@ -143,12 +143,12 @@ int suggest_passwords(void) {
 
         r = pwquality_read_config(pwq, NULL, &auxerror);
         if (r < 0)
-                log_warning_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to read libpwquality configuation, ignoring: %s",
+                log_warning_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to read libpwquality configuration, ignoring: %s",
                                   pwquality_strerror(buf, sizeof(buf), r, auxerror));
 
         pwquality_maybe_disable_dictionary(pwq);
 
-        suggestions = new0(char*, N_SUGGESTIONS);
+        suggestions = new0(char*, N_SUGGESTIONS+1);
         if (!suggestions)
                 return log_oom();
 

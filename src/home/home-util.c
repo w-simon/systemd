@@ -12,12 +12,12 @@
 
 bool suitable_user_name(const char *name) {
 
-        /* Checks whether the specified name is suitable for management via homed. Note that client-side we
-         * usually validate with the simple valid_user_group_name(), while server-side we are a bit more
+        /* Checks whether the specified name is suitable for management via homed. Note that client-side
+         * we usually validate with the simple valid_user_group_name(), while server-side we are a bit more
          * restrictive, so that we can change the rules server-side without having to update things
          * client-side too. */
 
-        if (!valid_user_group_name(name))
+        if (!valid_user_group_name(name, 0))
                 return false;
 
         /* We generally rely on NSS to tell us which users not to care for, but let's filter out some
@@ -62,6 +62,12 @@ int suitable_image_path(const char *path) {
         return !empty_or_root(path) &&
                 path_is_valid(path) &&
                 path_is_absolute(path);
+}
+
+bool supported_fstype(const char *fstype) {
+        /* Limit the set of supported file systems a bit, as protection against little tested kernel file
+         * systems. Also, we only support the resize ioctls for these file systems. */
+        return STR_IN_SET(fstype, "ext4", "btrfs", "xfs");
 }
 
 int split_user_name_realm(const char *t, char **ret_user_name, char **ret_realm) {
@@ -123,6 +129,8 @@ int bus_message_append_secret(sd_bus_message *m, UserRecord *secret) {
         r = json_variant_format(v, 0, &formatted);
         if (r < 0)
                 return r;
+
+        (void) sd_bus_message_sensitive(m);
 
         return sd_bus_message_append(m, "s", formatted);
 }

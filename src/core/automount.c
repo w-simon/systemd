@@ -152,6 +152,10 @@ static int automount_add_default_dependencies(Automount *a) {
         if (!MANAGER_IS_SYSTEM(UNIT(a)->manager))
                 return 0;
 
+        r = unit_add_dependency_by_name(UNIT(a), UNIT_BEFORE, SPECIAL_LOCAL_FS_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
+        if (r < 0)
+                return r;
+
         r = unit_add_dependency_by_name(UNIT(a), UNIT_AFTER, SPECIAL_LOCAL_FS_PRE_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
         if (r < 0)
                 return r;
@@ -705,25 +709,25 @@ static int automount_dispatch_expire(sd_event_source *source, usec_t usec, void 
 }
 
 static int automount_start_expire(Automount *a) {
-        int r;
         usec_t timeout;
+        int r;
 
         assert(a);
 
         if (a->timeout_idle_usec == 0)
                 return 0;
 
-        timeout = now(CLOCK_MONOTONIC) + MAX(a->timeout_idle_usec/3, USEC_PER_SEC);
+        timeout = MAX(a->timeout_idle_usec/3, USEC_PER_SEC);
 
         if (a->expire_event_source) {
-                r = sd_event_source_set_time(a->expire_event_source, timeout);
+                r = sd_event_source_set_time_relative(a->expire_event_source, timeout);
                 if (r < 0)
                         return r;
 
                 return sd_event_source_set_enabled(a->expire_event_source, SD_EVENT_ONESHOT);
         }
 
-        r = sd_event_add_time(
+        r = sd_event_add_time_relative(
                         UNIT(a)->manager->event,
                         &a->expire_event_source,
                         CLOCK_MONOTONIC, timeout, 0,
@@ -908,13 +912,7 @@ static int automount_deserialize_item(Unit *u, const char *key, const char *valu
                 if (safe_atou(value, &token) < 0)
                         log_unit_debug(u, "Failed to parse token value: %s", value);
                 else {
-                        r = set_ensure_allocated(&a->tokens, NULL);
-                        if (r < 0) {
-                                log_oom();
-                                return 0;
-                        }
-
-                        r = set_put(a->tokens, UINT_TO_PTR(token));
+                        r = set_ensure_put(&a->tokens, NULL, UINT_TO_PTR(token));
                         if (r < 0)
                                 log_unit_error_errno(u, r, "Failed to add token to set: %m");
                 }
@@ -924,13 +922,7 @@ static int automount_deserialize_item(Unit *u, const char *key, const char *valu
                 if (safe_atou(value, &token) < 0)
                         log_unit_debug(u, "Failed to parse token value: %s", value);
                 else {
-                        r = set_ensure_allocated(&a->expire_tokens, NULL);
-                        if (r < 0) {
-                                log_oom();
-                                return 0;
-                        }
-
-                        r = set_put(a->expire_tokens, UINT_TO_PTR(token));
+                        r = set_ensure_put(&a->expire_tokens, NULL, UINT_TO_PTR(token));
                         if (r < 0)
                                 log_unit_error_errno(u, r, "Failed to add expire token to set: %m");
                 }
@@ -1006,13 +998,7 @@ static int automount_dispatch_io(sd_event_source *s, int fd, uint32_t events, vo
                 } else
                         log_unit_debug(UNIT(a), "Got direct mount request on %s", a->where);
 
-                r = set_ensure_allocated(&a->tokens, NULL);
-                if (r < 0) {
-                        log_unit_error(UNIT(a), "Failed to allocate token set.");
-                        goto fail;
-                }
-
-                r = set_put(a->tokens, UINT_TO_PTR(packet.v5_packet.wait_queue_token));
+                r = set_ensure_put(&a->tokens, NULL, UINT_TO_PTR(packet.v5_packet.wait_queue_token));
                 if (r < 0) {
                         log_unit_error_errno(UNIT(a), r, "Failed to remember token: %m");
                         goto fail;
@@ -1026,13 +1012,7 @@ static int automount_dispatch_io(sd_event_source *s, int fd, uint32_t events, vo
 
                 automount_stop_expire(a);
 
-                r = set_ensure_allocated(&a->expire_tokens, NULL);
-                if (r < 0) {
-                        log_unit_error(UNIT(a), "Failed to allocate token set.");
-                        goto fail;
-                }
-
-                r = set_put(a->expire_tokens, UINT_TO_PTR(packet.v5_packet.wait_queue_token));
+                r = set_ensure_put(&a->expire_tokens, NULL, UINT_TO_PTR(packet.v5_packet.wait_queue_token));
                 if (r < 0) {
                         log_unit_error_errno(UNIT(a), r, "Failed to remember token: %m");
                         goto fail;
@@ -1105,6 +1085,7 @@ const UnitVTable automount_vtable = {
                 "Unit\0"
                 "Automount\0"
                 "Install\0",
+        .private_section = "Automount",
 
         .can_transient = true,
         .can_fail = true,
@@ -1133,7 +1114,6 @@ const UnitVTable automount_vtable = {
 
         .reset_failed = automount_reset_failed,
 
-        .bus_vtable = bus_automount_vtable,
         .bus_set_property = bus_automount_set_property,
 
         .shutdown = automount_shutdown,
